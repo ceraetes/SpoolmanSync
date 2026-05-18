@@ -1,8 +1,10 @@
-name: SpoolmanSync
+name: SpoolmanSync (Fork)
 version: "1.5.3"
 slug: spoolmansync-ha-addon
-description: Automatic filament tracking for Bambu Lab and Creality printers with Spoolman
-url: https://github.com/gibz104/SpoolmanSync
+description: >-
+  Fork of SpoolmanSync — automatic filament tracking for Bambu Lab and Creality with Spoolman.
+  Repo https://github.com/ceraetes/SpoolmanSync (upstream gibz104/SpoolmanSync).
+url: https://github.com/ceraetes/SpoolmanSync
 # Omit `image` so Supervisor builds from `Dockerfile` when this add-on is installed from Git.
 # (A fixed image would always pull upstream, ignoring fork/local changes.)
 # Prebuilt installs: uncomment and set registry + tag that matches `version` below.
@@ -15,7 +17,7 @@ arch:
 ingress: true
 ingress_port: 0
 panel_icon: mdi:target
-panel_title: SpoolmanSync
+panel_title: SpoolmanSync (Fork)
 
 # API access for connecting to HA
 homeassistant_api: true
