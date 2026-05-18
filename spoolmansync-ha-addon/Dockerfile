@@ -7,6 +7,9 @@
 FROM alpine:3.21 AS fetch
 RUN apk add --no-cache git ca-certificates
 WORKDIR /opt/monorepo
+# Include add-on metadata in this stage so Supervisor rebuilds re-clone the repo
+# when the add-on version changes.
+COPY config.yaml /tmp/spoolmansync-addon-config.yaml
 # Fork default: yours. Other forks/changes → edit URL or mirror (see DOCS.md).
 ARG CLONE_REPO_URL=https://github.com/ceraetes/SpoolmanSync.git
 # Branch or tag readable by git clone (-b …), usually main.
