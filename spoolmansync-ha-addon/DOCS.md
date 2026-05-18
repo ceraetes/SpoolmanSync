@@ -27,6 +27,15 @@ You can also configure the Spoolman URL from the SpoolmanSync Settings page afte
 - **Spoolman** running and accessible from Home Assistant
 - For Bambu Lab printers: **ha-bambulab** integration installed via [HACS](https://hacs.xyz/)
 - For Creality printers: **ha_creality_ws** integration installed via [HACS](https://hacs.xyz/)
+- **Outbound HTTPS during install** — local HA builds shallow-clone this Git repository (see Dockerfile `CLONE_REPO_URL` / `CLONE_REF`)
+
+## Local Supervisor build (no prebuilt `image`)
+
+Home Assistant sends only `spoolmansync-ha-addon/` as the Docker context, so this add-on Dockerfile **git clones** your monorepo, then builds from `app/`. That matches how GitHub Actions builds the add-on.
+
+- Defaults in `spoolmansync-ha-addon/Dockerfile`: `CLONE_REPO_URL` (`https://github.com/ceraetes/SpoolmanSync.git`) and `CLONE_REF=main`. **Other forks** should change those `ARG`s to their repo URL and branch/tag.
+- The first Raspberry Pi install can take a long time (Node build + Clone). Stable power/network helps.
+- If `git clone` fails, check Supervisor logs; private repos cannot be cloned anonymously.
 
 ## Full Documentation
 

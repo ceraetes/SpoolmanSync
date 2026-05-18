@@ -1,10 +1,9 @@
-app/node_modules
-app/.next
-app/src/generated
-homeassistant/
-spoolmansync-ha-addon/*.md
-spoolmansync-ha-addon/icon.png
-spoolmansync-ha-addon/logo.png
+# Build context for this Dockerfile is ONLY spoolmansync-ha-addon/.
+# Sources come from git clone inside the Dockerfile, not from the context.
+
+CHANGELOG.md
+DOCS.md
+icon.png
+logo.png
+translations
 *.md
-.git
-.github

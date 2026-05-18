@@ -128,15 +128,19 @@ jobs:
           cache-to: type=gha,mode=max
 
       # Build and push HA add-on image (multi-arch: amd64 + arm64)
-      # Context is repo root since Dockerfile needs both app/ and spoolmansync-ha-addon/rootfs/
+      # Supervisor uses only spoolmansync-ha-addon/ as context → Dockerfile clones the monorepo.
+      # CI uses the same: context addon dir + build-args for this repo/ref.
       - name: Build and push SpoolmanSync Add-on
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./spoolmansync-ha-addon
           file: ./spoolmansync-ha-addon/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-addon.outputs.tags }}
           labels: ${{ steps.meta-addon.outputs.labels }}
+          build-args: |
+            CLONE_REPO_URL=https://github.com/${{ github.repository }}.git
+            CLONE_REF=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
