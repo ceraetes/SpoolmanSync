@@ -3,7 +3,10 @@ version: "1.5.3"
 slug: spoolmansync-ha-addon
 description: Automatic filament tracking for Bambu Lab and Creality printers with Spoolman
 url: https://github.com/gibz104/SpoolmanSync
-image: ghcr.io/gibz104/spoolmansync-addon
+# Omit `image` so Supervisor builds from `Dockerfile` when this add-on is installed from Git.
+# (A fixed image would always pull upstream, ignoring fork/local changes.)
+# Prebuilt installs: uncomment and set registry + tag that matches `version` below.
+# image: ghcr.io/gibz104/spoolmansync-addon
 arch:
   - aarch64
   - amd64
