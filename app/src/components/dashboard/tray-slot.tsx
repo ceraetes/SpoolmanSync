@@ -32,6 +32,30 @@ import type { HATray } from '@/lib/api/homeassistant';
 import type { Spool } from '@/lib/api/spoolman';
 import { buildSpoolSearchValue, parseExtraValue } from '@/lib/api/spoolman';
 
+/** Mirrors webhook `isValidTrayUuid`: value used for auto-match vs tag / nfc_uid / nfc_uid_2 */
+function isTrayUuidValidForAutoMatch(trayUuid: string | undefined | null): boolean {
+  if (!trayUuid || trayUuid === 'unknown' || trayUuid === '') return false;
+  if (trayUuid.replace(/0/g, '') === '') return false;
+  return true;
+}
+
+function autoMatchBlockedReason(trayUuid: string | undefined | null): string {
+  if (trayUuid == null || trayUuid === '') {
+    return 'No tray_uuid from Home Assistant. Open the tray entity in HA → Attributes, and confirm your SpoolmanSync automation sends tray_uuid in the webhook.';
+  }
+  if (trayUuid === 'unknown') {
+    return 'tray_uuid is "unknown" — auto-match is disabled until the printer reports a real identifier.';
+  }
+  if (trayUuid.replace(/0/g, '') === '') {
+    return 'tray_uuid is all zeros — the printer reports no spool RFID id for this slot (common for empty or third-party spools).';
+  }
+  return '';
+}
+
+function normalizedHexIsh(s: string): string {
+  return s.replace(/[^a-fA-F0-9]/g, '').toLowerCase();
+}
+
 type SortBy = 'id' | 'name' | 'material' | 'vendor';
 
 interface MismatchInfo {
@@ -279,6 +303,51 @@ export function TraySlot({ tray, assignedSpool, spools, onAssign, onUnassign, mi
             Search and select a spool from your Spoolman inventory.
           </DialogDescription>
         </DialogHeader>
+
+        <div className="rounded-lg border bg-muted/50 p-3 text-xs space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-medium text-sm text-foreground">Identifiers for RFID / auto-match</span>
+            {isTrayUuidValidForAutoMatch(tray.tray_uuid) ? (
+              <Badge variant="outline" className="text-[10px] font-normal whitespace-normal text-left leading-snug max-w-[16rem] sm:max-w-none">
+                Compared to Spoolman extra: tag, nfc_uid, nfc_uid_2
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="text-[10px] shrink-0">Auto-match won&apos;t run</Badge>
+            )}
+          </div>
+          <p className="text-muted-foreground leading-relaxed">
+            SpoolmanSync matches the <strong>tray_uuid</strong> attribute from Home Assistant against your Spoolman extra fields (string compare, hex is case-insensitive).
+          </p>
+          <div className="space-y-2 rounded-md border bg-background px-2.5 py-2 font-mono text-[11px] break-all">
+            <div>
+              <div className="font-sans text-[10px] uppercase tracking-wide text-muted-foreground mb-0.5">tray_uuid (used for matching)</div>
+              <div>{tray.tray_uuid?.trim() || '—'}</div>
+            </div>
+            {tray.tag_uid != null && String(tray.tag_uid).trim() !== '' ? (
+              <div className="pt-2 border-t border-border/70">
+                <div className="font-sans text-[10px] uppercase tracking-wide text-muted-foreground mb-0.5">tag_uid (from printer / ha-bambulab)</div>
+                <div>{String(tray.tag_uid).trim()}</div>
+              </div>
+            ) : (
+              <p className="pt-2 border-t border-border/70 font-sans text-[10px] text-muted-foreground">
+                No <code className="text-[10px]">tag_uid</code> attribute on this tray entity — only tray_uuid applies.
+              </p>
+            )}
+          </div>
+          {!isTrayUuidValidForAutoMatch(tray.tray_uuid) && (
+            <p className="text-amber-800 dark:text-amber-200 leading-relaxed">{autoMatchBlockedReason(tray.tray_uuid)}</p>
+          )}
+          {(() => {
+            const a = normalizedHexIsh(tray.tray_uuid ?? '');
+            const b = normalizedHexIsh(tray.tag_uid ?? '');
+            if (!a || !b || a === b) return null;
+            return (
+              <p className="text-muted-foreground leading-relaxed">
+                <strong className="text-foreground">Note:</strong> tray_uuid and tag_uid differ here. Populate Spoolman with the value shown under tray_uuid unless you deliberately map something else — that is what the webhook compares to <code>nfc_uid</code> / <code>nfc_uid_2</code>.
+              </p>
+            );
+          })()}
+        </div>
 
         {/* Mismatch warning in dialog */}
         {mismatch && (

@@ -80,7 +80,10 @@ export interface HATray {
   name?: string;  // Filament name from RFID (e.g., "Matte Dark Blue")
   color?: string;
   material?: string;
-  tray_uuid?: string;  // Spool serial number (unique per physical spool)
+  /** Value sent to the webhook and used for auto-match vs Spoolman `tag` / `nfc_uid` / `nfc_uid_2` */
+  tray_uuid?: string;
+  /** Bambu AMS: raw RFID tag UID when ha-bambulab exposes it (may differ from tray_uuid; see integration docs) */
+  tag_uid?: string;
   remaining_weight?: number;
 }
 
@@ -835,6 +838,7 @@ export class HomeAssistantClient {
               color: trayState?.attributes.color as string,
               material: trayState?.attributes.type as string,
               tray_uuid: trayState?.attributes.tray_uuid as string,
+              tag_uid: typeof trayState?.attributes.tag_uid === 'string' ? trayState.attributes.tag_uid : undefined,
               remaining_weight: trayState?.attributes.remain as number,
             });
           }
@@ -858,6 +862,7 @@ export class HomeAssistantClient {
             color: extState?.attributes.color as string,
             material: extState?.attributes.type as string,
             tray_uuid: extState?.attributes.tray_uuid as string,
+            tag_uid: typeof extState?.attributes.tag_uid === 'string' ? extState.attributes.tag_uid : undefined,
             remaining_weight: extState?.attributes.remain as number,
           });
         }
