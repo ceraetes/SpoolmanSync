@@ -1,6 +1,6 @@
 name: SpoolmanSync (Fork)
 # Base patch matches upstream 1.5.4; -fork.N increments for fork-only HA updates (distinct from plain "1.5.4").
-version: "1.5.4-fork.1"
+version: "1.5.4-fork.2"
 slug: spoolmansync-ha-addon
 description: >-
   Fork of SpoolmanSync — automatic filament tracking for Bambu Lab and Creality with Spoolman.

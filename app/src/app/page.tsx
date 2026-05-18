@@ -43,6 +43,14 @@ interface Settings {
   showSpoolLocation?: boolean;
 }
 
+interface RematchResponse {
+  assigned: number;
+  alreadyAssigned: number;
+  skipped: number;
+  noMatch: number;
+  error?: string;
+}
+
 export default function Dashboard() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [printers, setPrinters] = useState<PrinterWithSpools[]>([]);
@@ -50,6 +58,7 @@ export default function Dashboard() {
   const [lowFilamentAlerts, setLowFilamentAlerts] = useState<ActiveAlert[]>([]);
   const [automationsStale, setAutomationsStale] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [rematching, setRematching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Track trays that have filament loaded but no spool assigned
@@ -258,6 +267,36 @@ export default function Dashboard() {
     }
   };
 
+  const handleForceRematch = async () => {
+    setRematching(true);
+    try {
+      const res = await fetch('/api/printers/rematch', {
+        method: 'POST',
+      });
+      const data: RematchResponse = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to force match trays');
+      }
+
+      if (data.assigned > 0) {
+        toast.success(`Matched ${data.assigned} spool${data.assigned === 1 ? '' : 's'} to current tray${data.assigned === 1 ? '' : 's'}`);
+      } else if (data.alreadyAssigned > 0) {
+        toast.info('Current trays already match Spoolman');
+      } else if (data.noMatch > 0) {
+        toast.warning('No matching Spoolman spools found for the current trays');
+      } else {
+        toast.info('No loaded trays with RFID data to match');
+      }
+
+      await fetchData();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to force match trays');
+    } finally {
+      setRematching(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-background">
@@ -330,9 +369,14 @@ export default function Dashboard() {
       <main className="w-full max-w-7xl mx-auto py-6 px-3 sm:px-4 md:px-6">
         <div className="mb-4 sm:mb-6 flex items-center justify-between gap-2">
           <h1 className="text-xl sm:text-2xl font-bold">Dashboard</h1>
-          <Button variant="outline" size="sm" onClick={fetchData}>
-            Refresh
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={handleForceRematch} disabled={rematching}>
+              {rematching ? 'Matching...' : 'Match Trays'}
+            </Button>
+            <Button variant="outline" size="sm" onClick={fetchData}>
+              Refresh
+            </Button>
+          </div>
         </div>
 
         {printers.length === 0 ? (
