@@ -294,81 +294,144 @@ export async function POST(request: NextRequest) {
 
       // Tray has filament - try to auto-match by spool serial number
       // Uses the `tag` field (stored on first spool_usage)
-      if (isValidTrayUuid(tray_uuid)) {
-        const matchedSpool = await client.findSpoolByTag(tray_uuid);
-
-        if (matchedSpool) {
-          await client.assignSpoolToTray(matchedSpool.id, trayUniqueId);
-
-          // Emit real-time update event
-          const updateEvent: SpoolUpdateEvent = {
-            type: 'assign',
-            spoolId: matchedSpool.id,
-            spoolName: matchedSpool.filament.name,
-            trayId: tray_entity_id,
-            timestamp: Date.now(),
-          };
-          spoolEvents.emit(SPOOL_UPDATED, updateEvent);
-
-          await createActivityLog({
-            type: 'spool_change',
-            message: `Auto-assigned spool #${matchedSpool.id} to ${tray_entity_id} (matched by spool serial)`,
-            details: { spoolId: matchedSpool.id, trayId: tray_entity_id, matchedBy: 'spool_serial', trayUuid: tray_uuid },
-          });
-
-          return NextResponse.json({
-            status: 'success',
-            spool: matchedSpool,
-            matchedBy: 'spool_serial',
-          });
+      if (!isValidTrayUuid(tray_uuid)) {
+        // Log why we're skipping auto-match entirely
+        let skipReason: string;
+        if (!tray_uuid || tray_uuid === '') {
+          skipReason = 'tray_uuid is empty or missing — HA automation did not send an identifier';
+        } else if (tray_uuid === 'unknown') {
+          skipReason = 'tray_uuid is "unknown" — printer has not reported an RFID identifier yet';
+        } else if (tray_uuid.replace(/0/g, '') === '') {
+          skipReason = `tray_uuid is all zeros (${tray_uuid}) — printer reports no RFID for this slot (third-party or non-RFID spool)`;
+        } else {
+          skipReason = `tray_uuid "${tray_uuid}" did not pass validation`;
         }
-
-        // Fallback: match against user-defined nfc_uid / nfc_uid_2 extra fields.
-        // This catches brand-new spools whose `tag` field has never been written
-        // by a prior print, as long as the user pre-populated those NFC UID fields
-        // in Spoolman.
-        const nfcMatchedSpool = await client.findSpoolByNfcUid(tray_uuid);
-
-        if (nfcMatchedSpool) {
-          await client.assignSpoolToTray(nfcMatchedSpool.id, trayUniqueId);
-
-          // Also store the serial in `tag` so subsequent inserts use the faster path
-          await client.setSpoolTag(nfcMatchedSpool.id, tray_uuid);
-
-          const updateEvent: SpoolUpdateEvent = {
-            type: 'assign',
-            spoolId: nfcMatchedSpool.id,
-            spoolName: nfcMatchedSpool.filament.name,
+        console.log(`[AutoMatch] Skipping auto-match for ${tray_entity_id}: ${skipReason}`);
+        await createActivityLog({
+          type: 'tray_change_detected',
+          message: `Tray change detected: ${tray_entity_id} — auto-match skipped`,
+          details: {
             trayId: tray_entity_id,
-            timestamp: Date.now(),
-          };
-          spoolEvents.emit(SPOOL_UPDATED, updateEvent);
-
-          await createActivityLog({
-            type: 'spool_change',
-            message: `Auto-assigned spool #${nfcMatchedSpool.id} to ${tray_entity_id} (matched by NFC UID)`,
-            details: { spoolId: nfcMatchedSpool.id, trayId: tray_entity_id, matchedBy: 'nfc_uid', trayUuid: tray_uuid },
-          });
-
-          return NextResponse.json({
-            status: 'success',
-            spool: nfcMatchedSpool,
-            matchedBy: 'nfc_uid',
-          });
-        }
+            printerReports: { name, material, tray_uuid },
+            autoMatchSkipped: true,
+            skipReason,
+            action: 'manual_assignment_required',
+          },
+        });
+        const updateEvent: SpoolUpdateEvent = {
+          type: 'tray_change',
+          trayId: tray_entity_id,
+          timestamp: Date.now(),
+        };
+        spoolEvents.emit(SPOOL_UPDATED, updateEvent);
+        return NextResponse.json({
+          status: 'no_match',
+          message: 'No spool assigned to this tray. Please assign a spool manually in SpoolmanSync.',
+          printerReports: { name, material, tray_uuid },
+          autoMatchSkipped: true,
+          skipReason,
+        });
       }
 
-      // No auto-match - user needs to manually assign spool
-      // Log what the printer detected for debugging
-      console.log(`Tray ${tray_entity_id} changed but no matching spool found. Printer reports: name="${name}", material="${material}", tray_uuid="${tray_uuid}"`);
+      // tray_uuid is valid — attempt matching (tag → nfc_uid → nfc_uid_2)
+      console.log(`[AutoMatch] Attempting auto-match for ${tray_entity_id} with tray_uuid="${tray_uuid}"`);
+      const matchedSpool = await client.findSpoolByTag(tray_uuid);
 
-      // Log to activity log so users can see all tray changes in the webapp
+      if (matchedSpool) {
+        await client.assignSpoolToTray(matchedSpool.id, trayUniqueId);
+
+        // Emit real-time update event
+        const updateEvent: SpoolUpdateEvent = {
+          type: 'assign',
+          spoolId: matchedSpool.id,
+          spoolName: matchedSpool.filament.name,
+          trayId: tray_entity_id,
+          timestamp: Date.now(),
+        };
+        spoolEvents.emit(SPOOL_UPDATED, updateEvent);
+
+        await createActivityLog({
+          type: 'spool_change',
+          message: `Auto-assigned spool #${matchedSpool.id} to ${tray_entity_id} (matched by spool serial)`,
+          details: { spoolId: matchedSpool.id, trayId: tray_entity_id, matchedBy: 'spool_serial', trayUuid: tray_uuid },
+        });
+
+        return NextResponse.json({
+          status: 'success',
+          spool: matchedSpool,
+          matchedBy: 'spool_serial',
+        });
+      }
+
+      console.log(`[AutoMatch] No extra.tag match for "${tray_uuid}" — trying nfc_uid / nfc_uid_2 fallback`);
+
+      // Fallback: match against user-defined nfc_uid / nfc_uid_2 extra fields.
+      // This catches brand-new spools whose `tag` field has never been written
+      // by a prior print, as long as the user pre-populated those NFC UID fields
+      // in Spoolman.
+      const nfcMatchedSpool = await client.findSpoolByNfcUid(tray_uuid);
+
+      if (nfcMatchedSpool) {
+        await client.assignSpoolToTray(nfcMatchedSpool.id, trayUniqueId);
+
+        // Also store the serial in `tag` so subsequent inserts use the faster path
+        await client.setSpoolTag(nfcMatchedSpool.id, tray_uuid);
+
+        const updateEvent: SpoolUpdateEvent = {
+          type: 'assign',
+          spoolId: nfcMatchedSpool.id,
+          spoolName: nfcMatchedSpool.filament.name,
+          trayId: tray_entity_id,
+          timestamp: Date.now(),
+        };
+        spoolEvents.emit(SPOOL_UPDATED, updateEvent);
+
+        await createActivityLog({
+          type: 'spool_change',
+          message: `Auto-assigned spool #${nfcMatchedSpool.id} to ${tray_entity_id} (matched by NFC UID)`,
+          details: { spoolId: nfcMatchedSpool.id, trayId: tray_entity_id, matchedBy: 'nfc_uid', trayUuid: tray_uuid },
+        });
+
+        return NextResponse.json({
+          status: 'success',
+          spool: nfcMatchedSpool,
+          matchedBy: 'nfc_uid',
+        });
+      }
+
+      // All auto-match fallbacks exhausted — gather diagnostics so the user can
+      // see exactly what was searched for and what values exist in Spoolman.
+      const diag = await client.getMatchDiagnostics(tray_uuid);
+
+      // Build readable summaries for the activity log
+      const tagSummary = diag.tagEntries.length > 0
+        ? diag.tagEntries.map(e => `  spool #${e.spoolId} (${e.spoolName}): tag="${e.storedValue}"`).join('\n')
+        : '  (no spools have an extra.tag value)';
+
+      const nfcSummary = diag.nfcUidEntries.length > 0
+        ? diag.nfcUidEntries.map(e => `  spool #${e.spoolId} (${e.spoolName}): ${e.field}="${e.storedValue}"`).join('\n')
+        : '  (no spools have extra.nfc_uid or extra.nfc_uid_2 values)';
+
+      console.log(
+        `[AutoMatch] No match found for ${tray_entity_id}.\n` +
+        `  Searched for tray_uuid: "${tray_uuid}"\n` +
+        `  Scanned ${diag.spoolsScanned} spools.\n` +
+        `  extra.tag values found:\n${tagSummary}\n` +
+        `  extra.nfc_uid / nfc_uid_2 values found:\n${nfcSummary}`
+      );
+
       await createActivityLog({
         type: 'tray_change_detected',
-        message: `Tray change detected: ${tray_entity_id} has filament but no matching spool`,
+        message: `Tray change detected: ${tray_entity_id} — no match after all fallbacks (tag + nfc_uid + nfc_uid_2)`,
         details: {
           trayId: tray_entity_id,
           printerReports: { name, material, tray_uuid },
+          autoMatch: {
+            searchedFor: diag.searchedFor,
+            spoolsScanned: diag.spoolsScanned,
+            tagEntriesFound: diag.tagEntries.map(e => ({ spoolId: e.spoolId, spoolName: e.spoolName, storedValue: e.storedValue })),
+            nfcEntriesFound: diag.nfcUidEntries.map(e => ({ spoolId: e.spoolId, spoolName: e.spoolName, field: e.field, storedValue: e.storedValue })),
+          },
           action: 'manual_assignment_required',
         },
       });
@@ -385,6 +448,12 @@ export async function POST(request: NextRequest) {
         status: 'no_match',
         message: 'No spool assigned to this tray. Please assign a spool manually in SpoolmanSync.',
         printerReports: { name, material, tray_uuid },
+        autoMatchDiagnostics: {
+          searchedFor: diag.searchedFor,
+          spoolsScanned: diag.spoolsScanned,
+          tagEntriesFound: diag.tagEntries,
+          nfcEntriesFound: diag.nfcUidEntries,
+        },
       });
     }
 

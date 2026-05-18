@@ -418,6 +418,75 @@ export class SpoolmanClient {
   }
 
   /**
+   * Explain why auto-match failed for a given tray_uuid.
+   * Returns a human-readable report of every tag / nfc_uid / nfc_uid_2 value
+   * found across all spools so the caller can log what was expected vs what exists.
+   */
+  async getMatchDiagnostics(trayUuid: string): Promise<{
+    searchedFor: string;
+    tagEntries: Array<{ spoolId: number; spoolName: string; storedValue: string }>;
+    nfcUidEntries: Array<{ spoolId: number; spoolName: string; field: string; storedValue: string }>;
+    spoolsScanned: number;
+  }> {
+    const spools = await this.getSpools();
+    const normalizedUuid = trayUuid.toLowerCase();
+
+    const tagEntries: Array<{ spoolId: number; spoolName: string; storedValue: string }> = [];
+    const nfcUidEntries: Array<{ spoolId: number; spoolName: string; field: string; storedValue: string }> = [];
+
+    for (const spool of spools) {
+      const spoolName = spool.filament?.name || spool.filament?.material || `spool #${spool.id}`;
+
+      // Check extra.tag
+      const tagRaw = spool.extra?.['tag'];
+      if (tagRaw) {
+        let tagValue: string;
+        try {
+          const parsed = JSON.parse(tagRaw);
+          tagValue = typeof parsed === 'string' ? parsed : String(parsed);
+        } catch {
+          tagValue = tagRaw;
+        }
+        if (tagValue) {
+          tagEntries.push({ spoolId: spool.id, spoolName, storedValue: tagValue });
+        }
+      }
+
+      // Check nfc_uid and nfc_uid_2
+      for (const key of ['nfc_uid', 'nfc_uid_2'] as const) {
+        const raw = spool.extra?.[key];
+        if (!raw) continue;
+        let value: string;
+        try {
+          const parsed = JSON.parse(raw);
+          value = typeof parsed === 'string' ? parsed : String(parsed);
+        } catch {
+          value = raw;
+        }
+        if (value) {
+          nfcUidEntries.push({ spoolId: spool.id, spoolName, field: key, storedValue: value });
+        }
+      }
+    }
+
+    // Sort entries: closest matches (same length, or shares prefix) first for readability
+    const score = (stored: string) => {
+      const s = stored.toLowerCase().replace(/[^a-f0-9]/g, '');
+      const t = normalizedUuid.replace(/[^a-f0-9]/g, '');
+      if (s === t) return 0;
+      let common = 0;
+      for (let i = 0; i < Math.min(s.length, t.length); i++) {
+        if (s[i] === t[i]) common++; else break;
+      }
+      return s.length === t.length ? 1 - common / t.length : 2;
+    };
+    tagEntries.sort((a, b) => score(a.storedValue) - score(b.storedValue));
+    nfcUidEntries.sort((a, b) => score(a.storedValue) - score(b.storedValue));
+
+    return { searchedFor: trayUuid, tagEntries, nfcUidEntries, spoolsScanned: spools.length };
+  }
+
+  /**
    * Update spool weight (use filament)
    */
   async useWeight(spoolId: number, weight: number): Promise<void> {
