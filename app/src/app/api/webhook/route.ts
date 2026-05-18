@@ -322,6 +322,40 @@ export async function POST(request: NextRequest) {
             matchedBy: 'spool_serial',
           });
         }
+
+        // Fallback: match against user-defined nfc_uid / nfc_uid_2 extra fields.
+        // This catches brand-new spools whose `tag` field has never been written
+        // by a prior print, as long as the user pre-populated those NFC UID fields
+        // in Spoolman.
+        const nfcMatchedSpool = await client.findSpoolByNfcUid(tray_uuid);
+
+        if (nfcMatchedSpool) {
+          await client.assignSpoolToTray(nfcMatchedSpool.id, trayUniqueId);
+
+          // Also store the serial in `tag` so subsequent inserts use the faster path
+          await client.setSpoolTag(nfcMatchedSpool.id, tray_uuid);
+
+          const updateEvent: SpoolUpdateEvent = {
+            type: 'assign',
+            spoolId: nfcMatchedSpool.id,
+            spoolName: nfcMatchedSpool.filament.name,
+            trayId: tray_entity_id,
+            timestamp: Date.now(),
+          };
+          spoolEvents.emit(SPOOL_UPDATED, updateEvent);
+
+          await createActivityLog({
+            type: 'spool_change',
+            message: `Auto-assigned spool #${nfcMatchedSpool.id} to ${tray_entity_id} (matched by NFC UID)`,
+            details: { spoolId: nfcMatchedSpool.id, trayId: tray_entity_id, matchedBy: 'nfc_uid', trayUuid: tray_uuid },
+          });
+
+          return NextResponse.json({
+            status: 'success',
+            spool: nfcMatchedSpool,
+            matchedBy: 'nfc_uid',
+          });
+        }
       }
 
       // No auto-match - user needs to manually assign spool

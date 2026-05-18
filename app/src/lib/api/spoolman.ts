@@ -384,6 +384,40 @@ export class SpoolmanClient {
   }
 
   /**
+   * Find a spool by NFC UID stored in user-defined extra fields.
+   * Checks both `nfc_uid` and `nfc_uid_2` against the Bambu tray_uuid.
+   * Comparison is case-insensitive to handle mixed hex casing.
+   * This serves as a fallback when the spool's `tag` field has not yet been
+   * populated by a prior print (i.e. the spool is brand-new or was never used
+   * with this printer before).
+   */
+  async findSpoolByNfcUid(trayUuid: string): Promise<Spool | null> {
+    const spools = await this.getSpools();
+    const normalizedUuid = trayUuid.toLowerCase();
+
+    for (const spool of spools) {
+      for (const key of ['nfc_uid', 'nfc_uid_2'] as const) {
+        const raw = spool.extra?.[key];
+        if (!raw) continue;
+
+        try {
+          const parsed = JSON.parse(raw);
+          if (typeof parsed === 'string' && parsed.toLowerCase() === normalizedUuid) {
+            return spool;
+          }
+        } catch {
+          // Stored without JSON encoding — compare directly
+          if (raw.toLowerCase() === normalizedUuid) {
+            return spool;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Update spool weight (use filament)
    */
   async useWeight(spoolId: number, weight: number): Promise<void> {
