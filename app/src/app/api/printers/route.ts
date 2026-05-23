@@ -3,6 +3,7 @@ import prisma from '@/lib/db';
 import { HomeAssistantClient, HATray } from '@/lib/api/homeassistant';
 import { SpoolmanClient, Spool } from '@/lib/api/spoolman';
 import { getHiddenPrinters } from '@/app/api/printers/setup/route';
+import { isValidTrayUuid } from '@/lib/tray-uuid';
 
 interface MismatchInfo {
   type: 'material' | 'color' | 'both';
@@ -33,8 +34,7 @@ function detectTrayMismatch(tray: HATray, assignedSpool: Spool): MismatchInfo | 
   // as all zeros for third-party spools without RFID tags. The color/material
   // data for these is user-configured in Bambu Studio (not from RFID), so it
   // won't reliably match Spoolman's vendor data and would cause false warnings.
-  const uuid = tray.tray_uuid?.replace(/0/g, '') || '';
-  if (!uuid) {
+  if (!isValidTrayUuid(tray.tray_uuid)) {
     return null;
   }
 

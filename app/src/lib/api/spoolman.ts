@@ -19,6 +19,9 @@ export interface Filament {
   density: number;
   diameter: number;
   weight?: number;
+  settings_extruder_temp?: number | null;
+  settings_bed_temp?: number | null;
+  extra?: Record<string, string>;
 }
 
 export interface Spool {
@@ -511,10 +514,70 @@ export class SpoolmanClient {
   }
 
   /**
+   * Get a filament by ID
+   */
+  async getFilament(id: number): Promise<Filament> {
+    return this.fetch(`/filament/${id}`);
+  }
+
+  /**
+   * Update a filament (generic PATCH)
+   */
+  async updateFilament(id: number, data: Record<string, unknown>): Promise<Filament> {
+    return this.fetch(`/filament/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  /**
    * Get all extra fields for spools
    */
   async getSpoolExtraFields(): Promise<ExtraField[]> {
     return this.fetch('/field/spool');
+  }
+
+  /**
+   * Get all extra fields for filaments
+   */
+  async getFilamentExtraFields(): Promise<ExtraField[]> {
+    return this.fetch('/field/filament');
+  }
+
+  /**
+   * Create or update an extra field for filaments
+   */
+  async createFilamentExtraField(
+    key: string,
+    name: string,
+    fieldType: string = 'text'
+  ): Promise<ExtraField[]> {
+    return this.fetch(`/field/filament/${key}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        field_type: fieldType,
+      }),
+    });
+  }
+
+  /**
+   * Store Bambu tray_info_idx on a filament (for AMS set_filament)
+   */
+  async setFilamentTrayInfoIdx(filamentId: number, trayInfoIdx: string): Promise<Filament> {
+    const filament = await this.getFilament(filamentId);
+    const newExtra: Record<string, string> = {};
+    if (filament.extra) {
+      for (const [key, value] of Object.entries(filament.extra)) {
+        newExtra[key] = value;
+      }
+    }
+    newExtra['bambu_tray_info_idx'] = JSON.stringify(trayInfoIdx.trim());
+
+    return this.fetch(`/filament/${filamentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ extra: newExtra }),
+    });
   }
 
   /**
@@ -553,6 +616,28 @@ export class SpoolmanClient {
     } catch (error) {
       console.error('[SpoolmanSync] Failed to ensure required fields exist:', error);
       throw new Error('Failed to configure Spoolman extra fields. Please ensure Spoolman is accessible and try again.');
+    }
+  }
+
+  /**
+   * Ensure filament extra field for Bambu AMS profile ID exists
+   */
+  async ensureBambuFilamentFieldExists(): Promise<void> {
+    try {
+      const existingFields = await this.getFilamentExtraFields();
+      const existingKeys = new Set(existingFields.map((f) => f.key));
+      if (!existingKeys.has('bambu_tray_info_idx')) {
+        await this.createFilamentExtraField(
+          'bambu_tray_info_idx',
+          'Bambu tray_info_idx',
+          'text'
+        );
+      }
+    } catch (error) {
+      console.error('[SpoolmanSync] Failed to ensure Bambu filament field exists:', error);
+      throw new Error(
+        'Failed to configure Spoolman filament extra fields. Please ensure Spoolman is accessible and try again.'
+      );
     }
   }
 }

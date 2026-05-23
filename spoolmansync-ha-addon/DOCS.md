@@ -22,6 +22,14 @@ Automatic filament tracking for Bambu Lab and Creality printers with Spoolman.
 
 You can also configure the Spoolman URL from the SpoolmanSync Settings page after opening the add-on.
 
+## Bambu AMS filament push
+
+When you assign a **non-Bambu** spool to an AMS tray without RFID, SpoolmanSync can call `bambu_lab.set_filament` to set color, material, and nozzle temps. Configure in the add-on **Settings** page under **Bambu AMS filament push**.
+
+Set each filament’s **Bambu tray_info_idx** in Spoolman (extra field created automatically) or pick a profile from the bundled Bambu catalog when assigning. Official Bambu spools and RFID trays are skipped.
+
+Custom Bambu Studio profiles use IDs starting with `P` (from your Bambu account). Enter those manually or read `filament_id` from the tray sensor in Home Assistant after configuring the slot in Bambu Studio once.
+
 ## Requirements
 
 - **Spoolman** running and accessible from Home Assistant

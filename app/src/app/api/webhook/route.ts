@@ -5,6 +5,7 @@ import { HomeAssistantClient } from '@/lib/api/homeassistant';
 import { spoolEvents, SPOOL_UPDATED, SpoolUpdateEvent } from '@/lib/events';
 import { createActivityLog } from '@/lib/activity-log';
 import { checkAndUpdateAlerts } from '@/lib/alerts';
+import { isValidTrayUuid } from '@/lib/tray-uuid';
 
 /**
  * Webhook endpoint for Home Assistant automations
@@ -21,14 +22,6 @@ import { checkAndUpdateAlerts } from '@/lib/alerts';
  *   remaining_weight: 800
  * }
  */
-
-/** Returns true if tray_uuid/rfid is a real spool identifier (not empty, unknown, or all zeros) */
-function isValidTrayUuid(tray_uuid: string | undefined | null): boolean {
-  if (!tray_uuid || tray_uuid === 'unknown' || tray_uuid === '') return false;
-  // ha-bambulab reports all zeros for non-Bambu spools without RFID tags
-  if (tray_uuid.replace(/0/g, '') === '') return false;
-  return true;
-}
 
 /**
  * Material density lookup (g/cm³) for converting filament length to weight.

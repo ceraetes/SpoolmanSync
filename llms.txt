@@ -21,6 +21,7 @@ Works with filament from any vendor (Polymaker, Sunlu, Elegoo, Hatchbox, eSUN, B
 - Write spool links to NFC sticker tags (tap with phone to assign, Android only)
 - Low stock alerts via Home Assistant notifications with configurable thresholds and grouping
 - Kiosk mode for touchscreen spool-scanning stations (e.g., Raspberry Pi)
+- **Bambu AMS filament push** — on assign, push color/material/temps to AMS for non-Bambu spools via ha-bambulab `set_filament` (requires filament `bambu_tray_info_idx`)
 - Localized Home Assistant support (English, German, Dutch, Spanish, Italian, French, and more)
 - Activity logging for spool changes and sync events
 - External spool / non-AMS printing support

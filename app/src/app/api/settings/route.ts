@@ -10,6 +10,7 @@ import {
   completeHAOnboarding,
 } from '@/lib/api/homeassistant';
 import { createActivityLog } from '@/lib/activity-log';
+import { getBambuAmsPushSettings, saveBambuAmsPushSettings } from '@/lib/bambu-ams-settings';
 
 export async function GET() {
   try {
@@ -32,6 +33,7 @@ export async function GET() {
           const isValid = await spoolmanClient.checkConnection();
           if (isValid) {
             await spoolmanClient.ensureRequiredFieldsExist();
+            await spoolmanClient.ensureBambuFilamentFieldExists();
             await prisma.spoolmanConnection.deleteMany();
             await prisma.spoolmanConnection.create({ data: { url: envSpoolmanUrl } });
             activeSpoolmanConnection = { id: '', url: envSpoolmanUrl, createdAt: new Date(), updatedAt: new Date() };
@@ -48,6 +50,7 @@ export async function GET() {
       // Fetch optional settings
       const qrBaseUrlSetting = await prisma.settings.findUnique({ where: { key: 'qr_base_url' } });
       const showLocationSetting = await prisma.settings.findUnique({ where: { key: 'show_spool_location' } });
+      const bambuAmsPush = await getBambuAmsPushSettings();
 
       return NextResponse.json({
         embeddedMode: false,
@@ -63,6 +66,7 @@ export async function GET() {
         } : null,
         qrBaseUrl: qrBaseUrlSetting?.value || '',
         showSpoolLocation: showLocationSetting?.value === 'true',
+        bambuAmsPush,
       });
     }
 
@@ -243,6 +247,7 @@ export async function GET() {
     // Fetch optional settings
     const qrBaseUrlSetting = await prisma.settings.findUnique({ where: { key: 'qr_base_url' } });
     const showLocationSetting = await prisma.settings.findUnique({ where: { key: 'show_spool_location' } });
+    const bambuAmsPush = await getBambuAmsPushSettings();
 
     return NextResponse.json({
       embeddedMode,
@@ -254,6 +259,7 @@ export async function GET() {
       } : null,
       qrBaseUrl: qrBaseUrlSetting?.value || '',
       showSpoolLocation: showLocationSetting?.value === 'true',
+      bambuAmsPush,
     });
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -337,6 +343,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true });
     }
 
+    if (type === 'bambu_ams_push') {
+      await saveBambuAmsPushSettings({
+        pushFilamentToAms: body.pushFilamentToAms !== false,
+        bambuVendorNames: Array.isArray(body.bambuVendorNames)
+          ? body.bambuVendorNames
+          : undefined,
+      });
+      return NextResponse.json({ success: true });
+    }
+
     if (type === 'qr_base_url') {
       // Save QR code base URL override
       const qrBaseUrl = (url || '').trim().replace(/\/+$/, '');
@@ -365,6 +381,7 @@ export async function POST(request: NextRequest) {
       // This includes active_tray (for tray assignments) and barcode (for QR scanning)
       try {
         await client.ensureRequiredFieldsExist();
+        await client.ensureBambuFilamentFieldExists();
       } catch (error) {
         console.error('Failed to ensure required fields:', error);
         return NextResponse.json({

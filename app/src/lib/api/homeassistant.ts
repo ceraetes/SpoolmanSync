@@ -84,6 +84,10 @@ export interface HATray {
   tray_uuid?: string;
   /** Bambu AMS: raw RFID tag UID when ha-bambulab exposes it (may differ from tray_uuid; see integration docs) */
   tag_uid?: string;
+  /** Bambu filament profile ID (tray_info_idx), e.g. GFA00 or custom P… ID */
+  filament_id?: string;
+  nozzle_temp_min?: number;
+  nozzle_temp_max?: number;
   remaining_weight?: number;
 }
 
@@ -839,6 +843,15 @@ export class HomeAssistantClient {
               material: trayState?.attributes.type as string,
               tray_uuid: trayState?.attributes.tray_uuid as string,
               tag_uid: typeof trayState?.attributes.tag_uid === 'string' ? trayState.attributes.tag_uid : undefined,
+              filament_id: typeof trayState?.attributes.filament_id === 'string'
+                ? trayState.attributes.filament_id
+                : undefined,
+              nozzle_temp_min: typeof trayState?.attributes.nozzle_temp_min === 'number'
+                ? trayState.attributes.nozzle_temp_min
+                : undefined,
+              nozzle_temp_max: typeof trayState?.attributes.nozzle_temp_max === 'number'
+                ? trayState.attributes.nozzle_temp_max
+                : undefined,
               remaining_weight: trayState?.attributes.remain as number,
             });
           }
@@ -863,6 +876,15 @@ export class HomeAssistantClient {
             material: extState?.attributes.type as string,
             tray_uuid: extState?.attributes.tray_uuid as string,
             tag_uid: typeof extState?.attributes.tag_uid === 'string' ? extState.attributes.tag_uid : undefined,
+            filament_id: typeof extState?.attributes.filament_id === 'string'
+              ? extState.attributes.filament_id
+              : undefined,
+            nozzle_temp_min: typeof extState?.attributes.nozzle_temp_min === 'number'
+              ? extState.attributes.nozzle_temp_min
+              : undefined,
+            nozzle_temp_max: typeof extState?.attributes.nozzle_temp_max === 'number'
+              ? extState.attributes.nozzle_temp_max
+              : undefined,
             remaining_weight: extState?.attributes.remain as number,
           });
         }

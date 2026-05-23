@@ -3,6 +3,8 @@ import prisma from '@/lib/db';
 import { SpoolmanClient } from '@/lib/api/spoolman';
 import { HomeAssistantClient } from '@/lib/api/homeassistant';
 import { createActivityLog } from '@/lib/activity-log';
+import { getBambuAmsPushSettings } from '@/lib/bambu-ams-settings';
+import { tryPushSpoolToAms } from '@/lib/bambu-ams-push';
 
 export async function GET() {
   try {
@@ -28,7 +30,7 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { spoolId, trayId } = body;
+    const { spoolId, trayId, bambuTrayInfoIdx } = body;
 
     const spoolmanConnection = await prisma.spoolmanConnection.findFirst();
 
@@ -51,16 +53,53 @@ export async function POST(request: NextRequest) {
       return entityIdMap.get(entityId) || entityId;
     });
 
-    const updatedSpool = await client.assignSpoolToTray(spoolId, trayId);
+    let updatedSpool = await client.assignSpoolToTray(spoolId, trayId);
 
-    // Log activity
+    if (bambuTrayInfoIdx && typeof bambuTrayInfoIdx === 'string' && bambuTrayInfoIdx.trim()) {
+      await client.setFilamentTrayInfoIdx(updatedSpool.filament.id, bambuTrayInfoIdx.trim());
+      updatedSpool = await client.getSpool(spoolId);
+    }
+
+    const pushSettings = await getBambuAmsPushSettings();
+    const haClient = await HomeAssistantClient.fromConnection();
+    const amsPush = await tryPushSpoolToAms(
+      haClient,
+      pushSettings,
+      updatedSpool,
+      trayId,
+      typeof bambuTrayInfoIdx === 'string' ? bambuTrayInfoIdx.trim() : undefined
+    );
+
     await createActivityLog({
       type: 'spool_change',
       message: `Assigned spool #${spoolId} to tray ${trayId}`,
-      details: { spoolId, trayId },
+      details: { spoolId, trayId, amsPush },
     });
 
-    return NextResponse.json({ spool: updatedSpool });
+    if (amsPush.status === 'pushed') {
+      await createActivityLog({
+        type: 'ams_filament_pushed',
+        message: `Pushed filament settings to AMS for spool #${spoolId}`,
+        details: { spoolId, trayId },
+      });
+    } else if (amsPush.status === 'failed') {
+      await createActivityLog({
+        type: 'ams_filament_push_failed',
+        message: `AMS push failed for spool #${spoolId}: ${amsPush.reason}`,
+        details: { spoolId, trayId, reason: amsPush.reason },
+      });
+    } else if (
+      amsPush.status !== 'skipped_disabled' &&
+      amsPush.status !== 'skipped_not_bambu_printer'
+    ) {
+      await createActivityLog({
+        type: 'ams_filament_push_skipped',
+        message: `AMS push skipped for spool #${spoolId}: ${amsPush.reason ?? amsPush.status}`,
+        details: { spoolId, trayId, status: amsPush.status, reason: amsPush.reason },
+      });
+    }
+
+    return NextResponse.json({ spool: updatedSpool, amsPush });
   } catch (error) {
     console.error('Error assigning spool:', error);
     return NextResponse.json({ error: 'Failed to assign spool' }, { status: 500 });

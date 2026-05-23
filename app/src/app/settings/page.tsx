@@ -37,6 +37,10 @@ interface Settings {
     error?: string;
   } | null;
   spoolman: { url: string; connected: boolean } | null;
+  bambuAmsPush?: {
+    pushFilamentToAms: boolean;
+    bambuVendorNames: string[];
+  };
 }
 
 interface ConfigEntry {
@@ -80,6 +84,9 @@ function SettingsContent() {
 
   // Dashboard display settings
   const [showSpoolLocation, setShowSpoolLocation] = useState(false);
+  const [pushFilamentToAms, setPushFilamentToAms] = useState(true);
+  const [bambuVendorNames, setBambuVendorNames] = useState('Bambu Lab, Bambu');
+  const [savingBambuAms, setSavingBambuAms] = useState(false);
 
   // QR base URL state
   const [qrBaseUrl, setQrBaseUrl] = useState('');
@@ -163,6 +170,10 @@ function SettingsContent() {
       }
       if (data.showSpoolLocation !== undefined) {
         setShowSpoolLocation(data.showSpoolLocation);
+      }
+      if (data.bambuAmsPush) {
+        setPushFilamentToAms(data.bambuAmsPush.pushFilamentToAms);
+        setBambuVendorNames(data.bambuAmsPush.bambuVendorNames.join(', '));
       }
     } catch {
       toast.error('Failed to load settings');
@@ -858,6 +869,75 @@ function SettingsContent() {
                       </p>
                     </div>
                   </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Bambu AMS filament push</CardTitle>
+                  <CardDescription>
+                    When assigning a non-Bambu spool to a Bambu AMS tray, push color, material, and
+                    temperatures via ha-bambulab. Requires a Bambu profile ID (tray_info_idx) on each
+                    filament. Skips Bambu vendor spools and trays that already have RFID.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex items-center space-x-3">
+                    <Checkbox
+                      id="push-filament-to-ams"
+                      checked={pushFilamentToAms}
+                      onCheckedChange={(checked) => setPushFilamentToAms(checked === true)}
+                    />
+                    <div>
+                      <Label htmlFor="push-filament-to-ams" className="text-sm font-medium cursor-pointer">
+                        Push Spoolman settings to AMS on assign
+                      </Label>
+                      <p className="text-xs text-muted-foreground">
+                        Uses Home Assistant service bambu_lab.set_filament
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="bambu-vendor-names">Bambu vendor names (skip RFID spools)</Label>
+                    <Input
+                      id="bambu-vendor-names"
+                      placeholder="Bambu Lab, Bambu"
+                      value={bambuVendorNames}
+                      onChange={(e) => setBambuVendorNames(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Comma-separated Spoolman vendor names treated as official Bambu filament
+                    </p>
+                  </div>
+                  <Button
+                    disabled={savingBambuAms}
+                    onClick={async () => {
+                      setSavingBambuAms(true);
+                      try {
+                        const names = bambuVendorNames
+                          .split(',')
+                          .map((s) => s.trim())
+                          .filter(Boolean);
+                        const res = await fetch('/api/settings', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            type: 'bambu_ams_push',
+                            pushFilamentToAms,
+                            bambuVendorNames: names.length > 0 ? names : ['Bambu Lab', 'Bambu'],
+                          }),
+                        });
+                        if (!res.ok) throw new Error();
+                        toast.success('Bambu AMS settings saved');
+                      } catch {
+                        toast.error('Failed to save Bambu AMS settings');
+                      } finally {
+                        setSavingBambuAms(false);
+                      }
+                    }}
+                  >
+                    {savingBambuAms ? 'Saving...' : 'Save Bambu AMS settings'}
+                  </Button>
                 </CardContent>
               </Card>
             </>

@@ -31,12 +31,15 @@ import { SpoolColorSwatch } from '@/components/spool-color-swatch';
 import type { HATray } from '@/lib/api/homeassistant';
 import type { Spool } from '@/lib/api/spoolman';
 import { buildSpoolSearchValue, parseExtraValue } from '@/lib/api/spoolman';
+import { isBambuVendor, getFilamentTrayInfoIdx } from '@/lib/bambu-ams-push';
+import { isValidTrayUuid } from '@/lib/tray-uuid';
+import type { BambuCatalogEntry } from '@/lib/bambu/filament-catalog';
 
-/** Mirrors webhook `isValidTrayUuid`: value used for auto-match vs tag / nfc_uid / nfc_uid_2 */
+const DEFAULT_BAMBU_VENDORS = ['Bambu Lab', 'Bambu'];
+
+/** Value used for auto-match vs tag / nfc_uid / nfc_uid_2 */
 function isTrayUuidValidForAutoMatch(trayUuid: string | undefined | null): boolean {
-  if (!trayUuid || trayUuid === 'unknown' || trayUuid === '') return false;
-  if (trayUuid.replace(/0/g, '') === '') return false;
-  return true;
+  return isValidTrayUuid(trayUuid);
 }
 
 function autoMatchBlockedReason(trayUuid: string | undefined | null): string {
@@ -82,10 +85,22 @@ interface TraySlotProps {
   tray: HATray;
   assignedSpool?: Spool;
   spools: Spool[];
-  onAssign: (spoolId: number) => void;
+  isBambuPrinter?: boolean;
+  onAssign: (spoolId: number, options?: { bambuTrayInfoIdx?: string }) => void | Promise<void>;
   onUnassign?: (spoolId: number) => void;
   mismatch?: MismatchInfo;
   showLocation?: boolean;
+}
+
+function spoolNeedsBambuProfile(
+  spool: Spool,
+  isBambuPrinter: boolean,
+  tray: HATray
+): boolean {
+  if (!isBambuPrinter) return false;
+  if (isValidTrayUuid(tray.tray_uuid)) return false;
+  if (isBambuVendor(spool.filament.vendor?.name, DEFAULT_BAMBU_VENDORS)) return false;
+  return !getFilamentTrayInfoIdx(spool.filament);
 }
 
 /**
@@ -126,11 +141,25 @@ function sortSpools(spools: Spool[], sortBy: SortBy): Spool[] {
   });
 }
 
-export function TraySlot({ tray, assignedSpool, spools, onAssign, onUnassign, mismatch, showLocation }: TraySlotProps) {
+export function TraySlot({
+  tray,
+  assignedSpool,
+  spools,
+  isBambuPrinter = false,
+  onAssign,
+  onUnassign,
+  mismatch,
+  showLocation,
+}: TraySlotProps) {
   const [open, setOpen] = useState(false);
   const [filters, setFilters] = useState<Record<string, string | null>>({});
   const [enabledFields, setEnabledFields] = useState<FilterField[]>([]);
   const [sortBy, setSortBy] = useState<SortBy>('id');
+  const [pendingSpool, setPendingSpool] = useState<Spool | null>(null);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [catalogEntries, setCatalogEntries] = useState<BambuCatalogEntry[]>([]);
+  const [selectedBambuIdx, setSelectedBambuIdx] = useState('');
+  const [catalogLoading, setCatalogLoading] = useState(false);
 
   // Fetch filter fields when dialog opens
   useEffect(() => {
@@ -154,8 +183,54 @@ export function TraySlot({ tray, assignedSpool, spools, onAssign, onUnassign, mi
   useEffect(() => {
     if (!open) {
       setFilters({});
+      setPendingSpool(null);
+      setCatalogQuery('');
+      setSelectedBambuIdx('');
+      setCatalogEntries([]);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!pendingSpool) return;
+    const timer = setTimeout(async () => {
+      setCatalogLoading(true);
+      try {
+        const params = catalogQuery.trim() ? `?q=${encodeURIComponent(catalogQuery.trim())}` : '';
+        const res = await fetch(`/api/bambu/filament-catalog${params}`);
+        if (res.ok) {
+          const data = await res.json();
+          setCatalogEntries((data.entries ?? []).slice(0, 40));
+        }
+      } catch {
+        setCatalogEntries([]);
+      } finally {
+        setCatalogLoading(false);
+      }
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [pendingSpool, catalogQuery]);
+
+  const confirmAssign = useCallback(
+    (spool: Spool, bambuTrayInfoIdx?: string) => {
+      onAssign(spool.id, bambuTrayInfoIdx ? { bambuTrayInfoIdx } : undefined);
+      setOpen(false);
+    },
+    [onAssign]
+  );
+
+  const handleSpoolSelect = useCallback(
+    (spool: Spool) => {
+      const existingIdx = getFilamentTrayInfoIdx(spool.filament);
+      if (spoolNeedsBambuProfile(spool, isBambuPrinter, tray) && !existingIdx) {
+        setPendingSpool(spool);
+        setCatalogQuery(spool.filament.material || '');
+        setSelectedBambuIdx('');
+        return;
+      }
+      confirmAssign(spool, existingIdx || undefined);
+    },
+    [confirmAssign, isBambuPrinter, tray]
+  );
 
   // Handle filter changes
   const handleFilterChange = useCallback((key: string, value: string | null) => {
@@ -437,10 +512,7 @@ export function TraySlot({ tray, assignedSpool, spools, onAssign, onUnassign, mi
                 <CommandItem
                   key={spool.id}
                   value={buildSpoolSearchValue(spool)}
-                  onSelect={() => {
-                    onAssign(spool.id);
-                    setOpen(false);
-                  }}
+                  onSelect={() => handleSpoolSelect(spool)}
                   className="flex items-center gap-3 py-2"
                 >
                   <SpoolColorSwatch filament={spool.filament} size="h-6 w-6" />
@@ -463,6 +535,68 @@ export function TraySlot({ tray, assignedSpool, spools, onAssign, onUnassign, mi
             </CommandGroup>
           </CommandList>
         </Command>
+
+        {pendingSpool && isBambuPrinter && (
+          <div className="rounded-lg border border-amber-300/60 bg-amber-50/80 dark:bg-amber-950/30 p-3 space-y-3">
+            <p className="text-xs text-amber-900 dark:text-amber-200">
+              <strong>{pendingSpool.filament.name || pendingSpool.filament.material}</strong> needs a
+              Bambu AMS profile (tray_info_idx) to push color and temperatures. Pick the closest match
+              from Bambu Studio&apos;s catalog, or enter a custom ID (e.g. from your Bambu account).
+            </p>
+            {tray.filament_id && (
+              <p className="text-[10px] text-muted-foreground">
+                Current tray profile on printer: <code className="font-mono">{tray.filament_id}</code>
+              </p>
+            )}
+            <Command shouldFilter={false}>
+              <CommandInput
+                placeholder="Search Bambu profiles (e.g. Generic PLA, Polymaker)..."
+                value={catalogQuery}
+                onValueChange={setCatalogQuery}
+              />
+              <CommandList className="max-h-[160px]">
+                <CommandEmpty>
+                  {catalogLoading ? 'Loading...' : 'No profiles found. Type a custom tray_info_idx below.'}
+                </CommandEmpty>
+                <CommandGroup>
+                  {catalogEntries.map((entry) => (
+                    <CommandItem
+                      key={`${entry.tray_info_idx}-${entry.name}`}
+                      value={`${entry.name} ${entry.tray_info_idx}`}
+                      onSelect={() => setSelectedBambuIdx(entry.tray_info_idx)}
+                    >
+                      <span className="truncate flex-1">{entry.name}</span>
+                      <span className="text-[10px] text-muted-foreground font-mono ml-2">
+                        {entry.tray_info_idx}
+                      </span>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </CommandList>
+            </Command>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <input
+                className="flex h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono"
+                placeholder="Or type tray_info_idx (GFL99, P9816594, ...)"
+                value={selectedBambuIdx}
+                onChange={(e) => setSelectedBambuIdx(e.target.value.trim())}
+              />
+              <div className="flex gap-2 shrink-0">
+                <Button
+                  size="sm"
+                  disabled={!selectedBambuIdx.trim()}
+                  onClick={() => confirmAssign(pendingSpool, selectedBambuIdx.trim())}
+                >
+                  Assign & push to AMS
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setPendingSpool(null)}>
+                  Back
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="flex justify-end">
           <Button variant="ghost" onClick={() => setOpen(false)}>
             Cancel

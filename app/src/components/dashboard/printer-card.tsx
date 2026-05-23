@@ -33,6 +33,7 @@ interface PrinterWithSpools {
   entity_id: string;
   name: string;
   state: string;
+  brand?: 'bambu_lab' | 'creality';
   ams_units: AMSWithSpools[];
   external_spools: TrayWithSpool[];
 }
@@ -40,12 +41,18 @@ interface PrinterWithSpools {
 interface PrinterCardProps {
   printer: PrinterWithSpools;
   spools: Spool[];
-  onSpoolAssign: (trayId: string, spoolId: number) => void;
+  onSpoolAssign: (
+    trayId: string,
+    spoolId: number,
+    options?: { bambuTrayInfoIdx?: string }
+  ) => void;
   onSpoolUnassign: (spoolId: number) => void;
   showSpoolLocation?: boolean;
 }
 
 export function PrinterCard({ printer, spools, onSpoolAssign, onSpoolUnassign, showSpoolLocation }: PrinterCardProps) {
+  const isBambuPrinter = printer.brand === 'bambu_lab';
+
   return (
     <Card className="w-full">
       <CardHeader className="pb-3">
@@ -67,7 +74,10 @@ export function PrinterCard({ printer, spools, onSpoolAssign, onSpoolUnassign, s
                   tray={tray}
                   assignedSpool={tray.assigned_spool}
                   spools={spools}
-                  onAssign={(spoolId) => onSpoolAssign(tray.unique_id || tray.entity_id, spoolId)}
+                  isBambuPrinter={isBambuPrinter}
+                  onAssign={(spoolId, options) =>
+                    onSpoolAssign(tray.unique_id || tray.entity_id, spoolId, options)
+                  }
                   onUnassign={onSpoolUnassign}
                   mismatch={tray.mismatch}
                   showLocation={showSpoolLocation}
@@ -90,8 +100,9 @@ export function PrinterCard({ printer, spools, onSpoolAssign, onSpoolUnassign, s
                   tray={extSpool}
                   assignedSpool={extSpool.assigned_spool}
                   spools={spools}
-                  onAssign={(spoolId) => {
-                    onSpoolAssign(extSpool.unique_id || extSpool.entity_id, spoolId);
+                  isBambuPrinter={isBambuPrinter}
+                  onAssign={(spoolId, options) => {
+                    onSpoolAssign(extSpool.unique_id || extSpool.entity_id, spoolId, options);
                   }}
                   onUnassign={onSpoolUnassign}
                   showLocation={showSpoolLocation}

@@ -41,6 +41,15 @@ interface Settings {
   homeassistant: { url: string; connected: boolean } | null;
   spoolman: { url: string; connected: boolean } | null;
   showSpoolLocation?: boolean;
+  bambuAmsPush?: {
+    pushFilamentToAms: boolean;
+    bambuVendorNames: string[];
+  };
+}
+
+interface AmsPushResult {
+  status: string;
+  reason?: string;
 }
 
 interface RematchResponse {
@@ -229,19 +238,38 @@ export default function Dashboard() {
     };
   }, [settings?.homeassistant, settings?.spoolman, fetchData]);
 
-  const handleSpoolAssign = async (trayId: string, spoolId: number) => {
+  const handleSpoolAssign = async (
+    trayId: string,
+    spoolId: number,
+    options?: { bambuTrayInfoIdx?: string }
+  ) => {
     try {
       const res = await fetch('/api/spools', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trayId, spoolId }),
+        body: JSON.stringify({
+          trayId,
+          spoolId,
+          bambuTrayInfoIdx: options?.bambuTrayInfoIdx,
+        }),
       });
 
       if (!res.ok) {
         throw new Error('Failed to assign spool');
       }
 
-      toast.success('Spool assigned successfully');
+      const data = await res.json() as { amsPush?: AmsPushResult };
+      const amsPush = data.amsPush;
+
+      if (amsPush?.status === 'pushed') {
+        toast.success('Spool assigned and AMS filament settings updated');
+      } else if (amsPush?.status === 'failed') {
+        toast.warning(`Spool assigned, but AMS update failed: ${amsPush.reason ?? 'unknown error'}`);
+      } else if (amsPush?.status === 'skipped_missing_tray_info_idx') {
+        toast.success('Spool assigned (set a Bambu profile to update the AMS slot)');
+      } else {
+        toast.success('Spool assigned successfully');
+      }
       fetchData(); // Refresh data
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to assign spool');

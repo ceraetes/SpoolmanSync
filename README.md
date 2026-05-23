@@ -78,6 +78,25 @@ Spool matching works in three ways:
 - **RFID auto-match** (Bambu spools with tags, Creality CFS spools with RFID) — remembers which physical spool is which for future swaps
 - **QR code / NFC** (any vendor) — scan printed QR labels or NFC stickers with your phone to assign
 
+## Bambu AMS filament push (third-party spools)
+
+For **non-Bambu** filament loaded in a Bambu AMS slot (no RFID), SpoolmanSync can push color, material type, and nozzle temperatures to the printer when you assign a spool. This uses the Home Assistant [ha-bambulab](https://github.com/greghesp/ha-bambulab) `bambu_lab.set_filament` service.
+
+**Skipped automatically when:**
+- The spool vendor is Bambu Lab (RFID handles official spools)
+- The tray already reports a valid RFID `tray_uuid` from the printer
+- The feature is disabled in **Settings → Bambu AMS filament push**
+
+**Required:** Each filament needs a Bambu profile ID (`tray_info_idx`) — the same IDs Bambu Studio uses in its filament list. SpoolmanSync creates a Spoolman filament extra field `bambu_tray_info_idx`. When assigning, use the built-in **Bambu profile** search (official + generic catalog bundled in SpoolmanSync) or type a custom ID.
+
+| Source | What you get |
+|--------|----------------|
+| **Bundled catalog** | Hundreds of official Bambu + generic profiles (`GFA00`, `GFL99`, …) — searchable in the assign dialog |
+| **Bambu Studio custom profiles** | IDs like `P9816594` synced to your Bambu account — enter manually in Spoolman or copy from a tray’s `filament_id` attribute in Home Assistant after setting the profile once in Studio |
+| **ha-bambulab cloud list** | Not exposed to Home Assistant today; a future `get_filament_catalog` service could merge your account’s custom filaments (requires cloud-linked HA, not pure LAN mode) |
+
+The display name on the printer comes from the chosen `tray_info_idx`, not from Spoolman’s vendor field. Bed temperature is not sent by `set_filament` (only nozzle min/max).
+
 ## Low Stock Alerts
 
 Get notified via Home Assistant when you're down to your last spool of a filament type and it's running low. Configure in **Settings → Low Filament Alerts**:
@@ -96,6 +115,8 @@ Alerts fire only when you're on your *last* spool of a group — no noise from p
 **QR scanner or NFC not working** — browsers require HTTPS for camera and NFC access from non-`localhost` addresses. Use a reverse proxy, Tailscale, or access via `http://localhost:3000` on the same machine. Web NFC is Android-only (Chrome, Edge, Opera, Samsung Internet).
 
 **Creality filament weight looks wrong** — ha_creality_ws reports filament usage in length (cm), which SpoolmanSync converts to weight using material density (PLA 1.24 g/cm³, PETG 1.27, ABS 1.04, etc., 1.75mm default diameter). For most common materials the conversion is accurate; exotic filaments may vary slightly.
+
+**AMS not updating after assign** — ensure **Push Spoolman settings to AMS** is enabled, the filament has `bambu_tray_info_idx` set (or pick a profile when assigning), and the tray has no RFID. Check SpoolmanSync Logs for `ams_filament_pushed` or `ams_filament_push_failed` entries.
 
 ## Links
 
