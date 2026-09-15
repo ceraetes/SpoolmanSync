@@ -104,13 +104,14 @@ export default function ReportsPage() {
       eventSource?.close();
       eventSource = null;
       eventSourceRef.current = null;
-      if (!sseConnected) {
-        if (sseCheckTimeout) {
-          clearTimeout(sseCheckTimeout);
-          sseCheckTimeout = null;
-        }
-        startPolling();
+      // Always fall back to polling — whether SSE never connected or it
+      // connected then dropped. startPolling() is idempotent (it returns
+      // early if already polling).
+      if (sseCheckTimeout) {
+        clearTimeout(sseCheckTimeout);
+        sseCheckTimeout = null;
       }
+      startPolling();
     };
 
     sseCheckTimeout = setTimeout(() => {

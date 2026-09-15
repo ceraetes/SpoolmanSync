@@ -98,6 +98,10 @@ export function UsageBySpool({ data }: UsageBySpoolProps) {
     return Array.from(set).sort();
   }, [data]);
 
+  // Map unique spoolId -> display name (the category axis keys on spoolId so each
+  // bar resolves to its own spool; this map renders the readable name for ticks/tooltip)
+  const nameById = useMemo(() => new Map(data.map(d => [d.spoolId, d.spoolName])), [data]);
+
   // Reset filter if the selected material disappears from data
   useEffect(() => {
     if (materialFilter && !materials.includes(materialFilter)) {
@@ -197,13 +201,15 @@ export function UsageBySpool({ data }: UsageBySpoolProps) {
                         />
                         <YAxis
                           type="category"
-                          dataKey="spoolName"
+                          dataKey="spoolId"
+                          tickFormatter={(id) => nameById.get(Number(id)) ?? `#${id}`}
                           width={150}
                           tick={tickStyle}
                           stroke={theme.border}
                         />
                         <Tooltip
                           formatter={(value) => [`${Number(value).toFixed(1)}g`, 'Used']}
+                          labelFormatter={(id) => nameById.get(Number(id)) ?? `#${id}`}
                           contentStyle={{
                             backgroundColor: 'var(--popover)',
                             border: '1px solid var(--border)',

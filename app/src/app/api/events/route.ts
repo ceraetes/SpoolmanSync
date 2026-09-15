@@ -1,3 +1,4 @@
+import { NextRequest } from 'next/server';
 import { spoolEvents, SPOOL_UPDATED, ACTIVITY_LOG_CREATED, ALERT_UPDATED, SpoolUpdateEvent, ActivityLogEvent } from '@/lib/events';
 
 /**
@@ -12,8 +13,13 @@ import { spoolEvents, SPOOL_UPDATED, ACTIVITY_LOG_CREATED, ALERT_UPDATED, SpoolU
 // Ensure this route is never statically optimized
 export const dynamic = 'force-dynamic';
 
-export async function GET(): Promise<Response> {
+export async function GET(request: NextRequest): Promise<Response> {
   const encoder = new TextEncoder();
+
+  // Shared between start() and cancel() so the cancel callback can tear down
+  // the EventEmitter listeners and heartbeat interval. Without this, every
+  // client disconnect leaked listeners and a setInterval timer.
+  let cleanup: () => void = () => {};
 
   const stream = new ReadableStream({
     start(controller) {
@@ -35,7 +41,8 @@ export async function GET(): Promise<Response> {
           const message = `data: ${JSON.stringify(event)}\n\n`;
           controller.enqueue(encoder.encode(message));
         } catch {
-          // Client disconnected, will be cleaned up
+          // Client disconnected — tear down immediately
+          cleanup();
         }
       });
 
@@ -46,7 +53,8 @@ export async function GET(): Promise<Response> {
           const message = `data: ${JSON.stringify({ ...event, eventType: 'activity_log' })}\n\n`;
           controller.enqueue(encoder.encode(message));
         } catch {
-          // Client disconnected, will be cleaned up
+          // Client disconnected — tear down immediately
+          cleanup();
         }
       });
 
@@ -56,7 +64,8 @@ export async function GET(): Promise<Response> {
           const message = `data: ${JSON.stringify({ type: 'alert_update', alerts: data })}\n\n`;
           controller.enqueue(encoder.encode(message));
         } catch {
-          // Client disconnected, will be cleaned up
+          // Client disconnected — tear down immediately
+          cleanup();
         }
       });
 
@@ -66,27 +75,36 @@ export async function GET(): Promise<Response> {
           const heartbeat = `data: ${JSON.stringify({ type: 'heartbeat', timestamp: Date.now() })}\n\n`;
           controller.enqueue(encoder.encode(heartbeat));
         } catch {
-          // Client disconnected
-          clearInterval(heartbeatInterval);
+          // Client disconnected — tear down immediately
+          cleanup();
         }
       }, 30000);
 
-      // Clean up on close
-      // Note: The controller doesn't have a direct close event, but the stream
-      // will be garbage collected when the client disconnects
-      const cleanup = () => {
+      // Idempotent teardown: unsubscribe listeners and clear the heartbeat.
+      // Guarded so repeated invocations (enqueue failures, cancel, abort) are
+      // safe to call multiple times.
+      let cleanedUp = false;
+      cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
         unsubscribeSpool();
         unsubscribeLog();
         unsubscribeAlert();
         clearInterval(heartbeatInterval);
       };
 
-      // Store cleanup function for potential manual cleanup
-      (controller as unknown as { cleanup?: () => void }).cleanup = cleanup;
+      // Tear down if the request is aborted (e.g. client navigates away).
+      if (request.signal) {
+        if (request.signal.aborted) {
+          cleanup();
+        } else {
+          request.signal.addEventListener('abort', () => cleanup());
+        }
+      }
     },
     cancel() {
       // Stream was cancelled (client disconnected)
-      console.log('SSE client disconnected');
+      cleanup();
     },
   });
 

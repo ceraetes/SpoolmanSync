@@ -9,11 +9,28 @@
 
 import { HAPrinter } from './api/homeassistant';
 
+/**
+ * A printer-level entity SpoolmanSync needs but could not find in HA.
+ * Surfaced to the caller (and on to the UI / activity log) rather than only
+ * warned to stdout — a missing `print_weight` silently disables all weight
+ * deduction for that printer, which is otherwise indistinguishable from
+ * "everything is configured and nothing is printing".
+ */
+export interface MissingEntityReport {
+  prefix: string;
+  name: string;
+  /** Translation keys we looked for, e.g. ['print_weight', 'print_progress']. */
+  missing: string[];
+  /** True when the miss disables filament-usage deduction entirely. */
+  breaksUsageTracking: boolean;
+}
+
 export interface GeneratedConfig {
   automationsYaml: string;
   configurationAdditions: string;
   printerCount: number;
   trayCount: number;
+  missingEntities: MissingEntityReport[];
 }
 
 /**
@@ -43,7 +60,8 @@ interface PrinterConfig {
 export function generateHAConfig(
   printers: HAPrinter[],
   webhookUrl: string,
-  spoolmanUrl: string
+  spoolmanUrl: string,
+  webhookSecret: string = ''
 ): GeneratedConfig {
   if (printers.length === 0) {
     return {
@@ -51,16 +69,34 @@ export function generateHAConfig(
       configurationAdditions: '',
       printerCount: 0,
       trayCount: 0,
+      missingEntities: [],
     };
   }
 
   // Process each printer
   const printerConfigs: PrinterConfig[] = [];
   const automationsYamlParts: string[] = [];
+  const missingEntityReports: MissingEntityReport[] = [];
   let totalTrayCount = 0;
 
   for (const printer of printers) {
     const prefix = printer.prefix;
+
+    // A printer with no trays at all has nothing to track, and generating for it
+    // emits triggers with an empty entity_id list — which Home Assistant rejects,
+    // taking the other printers' automations in the same file down with it.
+    // discoverPrinters() synthesizes a slot for single-spool printers (#68) so
+    // this should be unreachable; guard anyway rather than emit invalid YAML.
+    if (collectTrays(printer).length === 0) {
+      console.warn(`[SpoolmanSync] Printer ${prefix} has no AMS trays or external spools; skipping config generation for it.`);
+      missingEntityReports.push({
+        prefix,
+        name: printer.name,
+        missing: ['tray/external spool entities'],
+        breaksUsageTracking: true,
+      });
+      continue;
+    }
 
     if (printer.brand === 'creality') {
       // Creality printer — different entity structure
@@ -75,6 +111,12 @@ export function generateHAConfig(
       }
       if (missingEntities.length > 0) {
         console.warn(`[SpoolmanSync] Missing entities for ${prefix}: ${missingEntities.join(', ')}. Please report at https://github.com/gibz104/SpoolmanSync/issues`);
+        missingEntityReports.push({
+          prefix,
+          name: printer.name,
+          missing: missingEntities,
+          breaksUsageTracking: !printer.used_material_entity,
+        });
       }
 
       const discoveredEntities: LocalizedEntities = {
@@ -106,6 +148,14 @@ export function generateHAConfig(
       }
       if (missingEntities.length > 0) {
         console.warn(`[SpoolmanSync] Missing entities for ${prefix}: ${missingEntities.join(', ')}. Please report at https://github.com/gibz104/SpoolmanSync/issues`);
+        missingEntityReports.push({
+          prefix,
+          name: printer.name,
+          missing: missingEntities,
+          // Usage is print_weight × print_progress — either one missing means
+          // no weight can ever be computed, so nothing is ever deducted.
+          breaksUsageTracking: !printer.print_weight_entity || !printer.print_progress_entity,
+        });
       }
 
       const discoveredEntities: LocalizedEntities = {
@@ -123,13 +173,16 @@ export function generateHAConfig(
   }
 
   const automationsYaml = automationsYamlParts.join('\n');
-  const configurationAdditions = generateConfigurationAdditions(printerConfigs, spoolmanUrl);
+  const configurationAdditions = generateConfigurationAdditions(printerConfigs, spoolmanUrl, webhookSecret);
 
   return {
     automationsYaml,
     configurationAdditions,
-    printerCount: printers.length,
+    // Printers actually configured — differs from printers.length only when one
+    // was skipped above for having no trays.
+    printerCount: printerConfigs.length,
     trayCount: totalTrayCount,
+    missingEntities: missingEntityReports,
   };
 }
 
@@ -208,6 +261,37 @@ function generateAutomationsYaml(
   // Build the tray_sensor lookup template
   const trayEntityLookup = buildTrayEntityLookup(allTrays);
 
+  // Print-end / offline triggers depend on the printer's stage entity. If it
+  // wasn't discovered, emitting `entity_id:` with nothing after it produces an
+  // invalid trigger and Home Assistant refuses to load the WHOLE automation —
+  // taking tray-change tracking down with it. Omit them instead: the automation
+  // still loads and tray-change flushes keep working.
+  const printerStateTriggers = entities.current_stage
+    ? `
+    - entity_id: ${entities.current_stage}
+      to:
+        - finished
+        - idle
+      id: print_end
+      trigger: state
+    - entity_id: ${entities.current_stage}
+      to:
+        - offline
+      # Only treat a SUSTAINED offline as a power-off. Brief MQTT flickers (e.g.
+      # Panda Touch competing for the printer's client slots) bounce the stage
+      # through offline for seconds; zeroing the usage meter on every such blip
+      # silently discarded the filament tracked so far, so a print's deduction
+      # shrank to only what accrued after the last flicker (#75). The for-timer
+      # restarts on any bounce, so flickers never fire this trigger, while a
+      # real power-off still resets the meter (#66).
+      for: "00:02:00"
+      id: offline
+      trigger: state`
+    : `
+    # NOTE: no print-stage entity was discovered for this printer, so the
+    # print-end and offline triggers are omitted. Usage is then only flushed on
+    # tray changes, never at print end.`;
+
   return `# =============================================================================
 # SpoolmanSync Automation: Track Spool Usage
 #
@@ -230,13 +314,19 @@ function generateAutomationsYaml(
   triggers:
     - entity_id: sensor.spoolmansync_${prefix}_active_tray
       id: tray
-      trigger: state
-    - entity_id: ${entities.current_stage}
-      to:
-        - finished
-        - idle
-      id: print_end
-      trigger: state
+      # Ignore transient availability flickers (e.g. MQTT reconnects). A blip to
+      # 'unavailable' and back is not a real tray change and must not run this
+      # automation — the from-tray edge would otherwise hit the flush branch and
+      # post a spurious early deduction (#69). Empty-string blips are handled
+      # differently: '' is the sensor's normal idle state, so it stays
+      # triggerable and the meter is preserved in the actions instead (#77).
+      not_from:
+        - unavailable
+        - unknown
+      not_to:
+        - unavailable
+        - unknown
+      trigger: state${printerStateTriggers}
   variables:
     # For tray trigger: get the old tray composite ID (what we're switching FROM)
     old_tray: |-
@@ -252,12 +342,18 @@ function generateAutomationsYaml(
       {% else %}
         -1
       {% endif %}
-    # For print_end: use the helper
+    # Last tray this automation knew was in use. The active-tray sensor renders
+    # '' whenever no tray reports active, so every blip passes through '' and
+    # the from-state often names no tray (#77) — the helper is the flush target
+    # for those cases.
+    helper_tray: "{{ states('input_number.spoolmansync_${prefix}_last_tray') | int(-1) }}"
+    # For print_end: use the helper. For tray triggers: the from-state's tray,
+    # falling back to the helper when the from-state names none.
     tray_composite: |-
       {% if trigger.id == 'print_end' %}
-        {{ states('input_number.spoolmansync_${prefix}_last_tray') | int(-1) }}
+        {{ helper_tray }}
       {% else %}
-        {{ old_tray }}
+        {{ old_tray if old_tray >= 0 else helper_tray }}
       {% endif %}
     # Build sensor entity ID for the tray we're logging
     tray_sensor: "${trayEntityLookup}"
@@ -269,28 +365,33 @@ function generateAutomationsYaml(
   actions:
     - choose:
         # =====================================================================
-        # TRAY CHANGE - Log old tray usage (if valid), ALWAYS update helper
+        # TRAY CHANGE - Flush usage to the outgoing (or last known) tray,
+        # then update the helper when a new tray is active
         # =====================================================================
         - conditions:
             - condition: template
               value_template: "{{ trigger.id == 'tray' }}"
           sequence:
-            # Log usage from OLD tray if:
-            # 1. old_tray was valid (>= 0)
-            # 2. we have weight to log (>= 0.01g)
-            # 3. tray_sensor resolved to a valid entity (defense-in-depth)
+            # Flush accumulated usage when we know which tray it belongs to:
+            # - a known tray goes inactive (old_tray >= 0, the pre-#77 case), or
+            # - a DIFFERENT tray becomes active after a gap (old_tray < 0 because
+            #   the from-state was '' or the inactive edge was missed): flush to
+            #   the last known tray (helper) before tracking the new one (#77).
             # Note: We don't check current stage because accumulated weight on the
             # utility meter represents real filament consumption that should be logged.
             # This handles cancelled prints where the user unloads filament while idle.
             - choose:
                 - conditions:
                     - condition: template
-                      value_template: "{{ old_tray >= 0 and tray_weight >= 0.01 and tray_sensor != '' }}"
+                      value_template: >-
+                        {{ tray_composite >= 0 and tray_weight >= 0.01 and tray_sensor != ''
+                           and (old_tray >= 0 or (new_tray >= 0 and new_tray != tray_composite)) }}
                   sequence:
                     - action: system_log.write
                       data:
                         message: >-
                           SPOOLMANSYNC TRAY CHANGE | Old tray {{ old_tray }} -> New tray {{ new_tray }} |
+                          Flush tray {{ tray_composite }} |
                           Sensor: {{ tray_sensor }} |
                           Spool: {{ name }} ({{ material }}) |
                           Weight used: {{ tray_weight }}g |
@@ -309,21 +410,39 @@ function generateAutomationsYaml(
                         entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
                       data:
                         value: "0"
+                # A known tray went inactive with nothing to flush: reset so no
+                # stale value accumulates (unchanged pre-#77 behavior).
+                - conditions:
+                    - condition: template
+                      value_template: "{{ old_tray >= 0 }}"
+                  sequence:
+                    - action: system_log.write
+                      data:
+                        message: >-
+                          SPOOLMANSYNC TRAY CHANGE (no usage logged) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                          Weight: {{ tray_weight }}g |
+                          Reason: {{ 'no weight to log' if tray_weight < 0.01 else 'tray sensor not found' }}
+                        # Warn when real grams are discarded: we cannot identify
+                        # the spool so we cannot bill anyone, but the loss must
+                        # be visible rather than silent (#78).
+                        level: "{{ 'warning' if tray_weight >= 0.01 else 'debug' }}"
+                    - action: utility_meter.calibrate
+                      target:
+                        entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
+                      data:
+                        value: "0"
+              # No tray in the from-state and nothing owed to a different tray
+              # (same-tray blip, or no last tray known): PRESERVE the meter.
+              # Zeroing here is what silently discarded mid-print usage on
+              # '' round-trips (#77, follow-up to #69).
               default:
                 - action: system_log.write
                   data:
                     message: >-
-                      SPOOLMANSYNC TRAY CHANGE (no usage logged) | Old: {{ old_tray }} -> New: {{ new_tray }} |
-                      Weight: {{ tray_weight }}g |
-                      Reason: {{ 'old_tray invalid' if old_tray < 0 else 'no weight to log' }}
-                    level: debug
-                # Reset meter anyway to prevent stale values from accumulating
-                - action: utility_meter.calibrate
-                  target:
-                    entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
-                  data:
-                    value: "0"
-            # ALWAYS update helper to new tray composite ID
+                      SPOOLMANSYNC TRAY CHANGE (meter preserved) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                      Weight: {{ tray_weight }}g | Last tray: {{ helper_tray }}
+                    level: info
+            # Update helper to the new tray composite ID (when one is active)
             - condition: template
               value_template: "{{ new_tray >= 0 }}"
             - action: input_number.set_value
@@ -338,13 +457,21 @@ function generateAutomationsYaml(
 
         # =====================================================================
         # PRINT END - Log final tray usage from helper
+        #
+        # 'offline' is deliberately NOT excluded from from_state: many printers'
+        # connection blips for a few seconds right at print completion, so the
+        # stage arrives at idle FROM offline and the deduction was silently
+        # skipped (#75 follow-up). Power-on re-deduction (#66) is guarded
+        # elsewhere: the meter is zeroed after every flush, a sustained offline
+        # zeroes it too, and the usage sensor cannot re-accumulate across the
+        # outage, so a boot-time print_end flushes 0g and does nothing.
         # =====================================================================
         - conditions:
             - condition: template
               value_template: >-
                 {{ trigger.id == 'print_end'
                    and trigger.from_state is not none
-                   and trigger.from_state.state not in ['unavailable', 'unknown', 'idle', 'finished'] }}
+                   and trigger.from_state.state not in ['unavailable', 'unknown', 'idle', 'finished', 'none'] }}
           sequence:
             - choose:
                 - conditions:
@@ -374,7 +501,10 @@ function generateAutomationsYaml(
                     message: >-
                       SPOOLMANSYNC PRINT END (skipped) | Tray: {{ tray_composite }} | Weight: {{ tray_weight }}g |
                       Reason: {{ 'no tray in helper' if tray_composite < 0 else 'no weight' }}
-                    level: warning
+                    # Quiet when the meter is empty: with 'offline' allowed as a
+                    # from_state this fires benignly on every printer power-on.
+                    # Warn when real grams are discarded instead (#78).
+                    level: "{{ 'warning' if tray_weight >= 0.01 else 'info' }}"
             # Always reset meter after print
             - action: utility_meter.calibrate
               target:
@@ -384,6 +514,68 @@ function generateAutomationsYaml(
             - action: system_log.write
               data:
                 message: "SPOOLMANSYNC METER RESET after print end"
+                level: info
+
+        # =====================================================================
+        # PRINTER OFFLINE - Bank the usage, THEN reset the meter
+        #
+        # The reset is what keeps #66 safe (a power-on print_end must find an
+        # empty meter), but resetting ALONE silently destroyed every gram the
+        # printer had used before it dropped off: a >2min network blip mid-print
+        # cost one user 105g (#78). Deducting first keeps both the guard and the
+        # grams.
+        #
+        # Deducting works even with the printer away: the tray comes from the
+        # input_number helper, not from the printer, and the webhook needs only
+        # that plus the weight. The filament name/color attributes read empty
+        # here, which is harmless (they are logging-only for spool_usage).
+        #
+        # REQUIRES always_available on the utility_meter. Without it the meter
+        # goes unavailable along with its source and the float(0) fallback would
+        # read it as 0g here, deducting nothing. See generateConfigurationAdditions.
+        # =====================================================================
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'offline' }}"
+          sequence:
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ tray_composite >= 0 and tray_weight >= 0.01 and tray_sensor != '' }}"
+                  sequence:
+                    - action: system_log.write
+                      data:
+                        message: >-
+                          SPOOLMANSYNC OFFLINE FLUSH | Tray {{ tray_composite }} |
+                          Sensor: {{ tray_sensor }} |
+                          Weight used: {{ tray_weight }}g
+                        level: info
+                    - action: rest_command.spoolmansync_update_spool
+                      data:
+                        filament_name: "{{ name }}"
+                        filament_material: "{{ material }}"
+                        filament_tray_uuid: "{{ tray_uuid }}"
+                        filament_used_weight: "{{ tray_weight }}"
+                        filament_color: "{{ color }}"
+                        filament_active_tray_id: "{{ tray_sensor }}"
+              default:
+                - action: system_log.write
+                  data:
+                    message: >-
+                      SPOOLMANSYNC OFFLINE FLUSH (skipped) | Tray: {{ tray_composite }} | Weight: {{ tray_weight }}g |
+                      Reason: {{ 'no tray in helper' if tray_composite < 0 else 'no weight' if tray_weight < 0.01 else 'tray sensor not found' }}
+                    # Warn only when grams are actually discarded. With an empty
+                    # meter this fires benignly every time the printer is shut
+                    # off, so that case stays quiet.
+                    level: "{{ 'warning' if tray_weight >= 0.01 else 'info' }}"
+            - action: utility_meter.calibrate
+              target:
+                entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
+              data:
+                value: "0"
+            - action: system_log.write
+              data:
+                message: "SPOOLMANSYNC METER RESET (printer offline) | ${prefix}"
                 level: info
   mode: single
 
@@ -432,6 +624,9 @@ ${trayEntityIds.map(id => `        - ${id}`).join('\n')}
         name: "{{ name }}"
         material: "{{ material }}"
         color: "{{ color }}"
+        current_print_state: ${entities.current_stage
+          ? `"{{ states('${entities.current_stage}') }}"`
+          : `"unknown"  # no print-stage entity discovered`}
   mode: queued
   max: 10
 `;
@@ -445,6 +640,8 @@ ${trayEntityIds.map(id => `        - ${id}`).join('\n')}
  * - Uses used_material_length (cm) instead of print_weight * progress
  * - Uses 'selected' attribute (0/1) instead of 'active' for tray detection
  * - CFS slot attributes: name, color_hex, type, rfid (vs Bambu's name, color, type, tray_uuid)
+ * - No per-spool serial: 'rfid' is a material-type code, so no tray_uuid is sent
+ *   and serial auto-matching is off for Creality (see src/lib/creality.ts)
  */
 function generateCrealityAutomationsYaml(
   prefix: string,
@@ -454,6 +651,31 @@ function generateCrealityAutomationsYaml(
 ): string {
   const trayEntityIds = allTrays.map(t => t.entityId);
   const trayEntityLookup = buildTrayEntityLookup(allTrays);
+
+  // Same guard as the Bambu generator: a trigger with a blank entity_id makes
+  // Home Assistant reject the entire automation. Creality's stage entity is the
+  // printer's own print_status entity, so this is defensive rather than expected.
+  const printerStateTriggers = entities.current_stage
+    ? `
+    - entity_id: ${entities.current_stage}
+      to:
+        - completed
+        - idle
+      id: print_end
+      trigger: state
+    - entity_id: ${entities.current_stage}
+      to:
+        - 'off'
+        - offline
+      # Sustained offline only — brief connection flickers must not zero the
+      # usage meter (#75); the for-timer restarts on any bounce.
+      for: "00:02:00"
+      id: offline
+      trigger: state`
+    : `
+    # NOTE: no print-status entity was discovered for this printer, so the
+    # print-end and offline triggers are omitted. Usage is then only flushed on
+    # slot changes, never at print end.`;
 
   return `# =============================================================================
 # SpoolmanSync Automation: Track Spool Usage (Creality)
@@ -473,13 +695,19 @@ function generateCrealityAutomationsYaml(
   triggers:
     - entity_id: sensor.spoolmansync_${prefix}_active_tray
       id: tray
-      trigger: state
-    - entity_id: ${entities.current_stage}
-      to:
-        - completed
-        - idle
-      id: print_end
-      trigger: state
+      # Ignore transient availability flickers (e.g. MQTT reconnects). A blip to
+      # 'unavailable' and back is not a real tray change and must not run this
+      # automation — the from-slot edge would otherwise hit the flush branch and
+      # post a spurious early deduction (#69). Empty-string blips are handled
+      # differently: '' is the sensor's normal idle state, so it stays
+      # triggerable and the meter is preserved in the actions instead (#77).
+      not_from:
+        - unavailable
+        - unknown
+      not_to:
+        - unavailable
+        - unknown
+      trigger: state${printerStateTriggers}
   variables:
     old_tray: |-
       {% if trigger.id == 'tray' and trigger.from_state is not none and trigger.from_state.state not in [None, '', 'unknown', 'unavailable'] %}
@@ -493,49 +721,82 @@ function generateCrealityAutomationsYaml(
       {% else %}
         -1
       {% endif %}
+    # Last slot this automation knew was in use — flush target when the
+    # from-state names no slot (the sensor renders '' between changes, #77).
+    helper_tray: "{{ states('input_number.spoolmansync_${prefix}_last_tray') | int(-1) }}"
     tray_composite: |-
       {% if trigger.id == 'print_end' %}
-        {{ states('input_number.spoolmansync_${prefix}_last_tray') | int(-1) }}
+        {{ helper_tray }}
       {% else %}
-        {{ old_tray }}
+        {{ old_tray if old_tray >= 0 else helper_tray }}
       {% endif %}
     tray_sensor: "${trayEntityLookup}"
     tray_usage_cm: "{{ states('sensor.spoolmansync_${prefix}_filament_usage_meter') | float(0) | round(2) }}"
-    tray_uuid: "{{ state_attr(tray_sensor, 'rfid') | default('') }}"
+    # Creality's 'rfid' attribute is a MATERIAL-TYPE code (PLA 00001, PETG 00003,
+    # ...), shared by every spool of that material — not a per-spool serial. It is
+    # logged for diagnostics only and deliberately NOT sent as tray_uuid; doing so
+    # made SpoolmanSync auto-assign whichever spool last carried that code. See
+    # src/lib/creality.ts.
+    material_code: "{{ state_attr(tray_sensor, 'rfid') | default('') }}"
     material: "{{ state_attr(tray_sensor, 'type') | default('') }}"
     name: "{{ state_attr(tray_sensor, 'name') | default('') }}"
     color: "{{ state_attr(tray_sensor, 'color_hex') | default('') }}"
   actions:
     - choose:
         # =====================================================================
-        # TRAY CHANGE - Log old tray usage (if valid), ALWAYS update helper
+        # TRAY CHANGE - Flush usage to the outgoing (or last known) tray,
+        # then update the helper when a new tray is active
         # =====================================================================
         - conditions:
             - condition: template
               value_template: "{{ trigger.id == 'tray' }}"
           sequence:
+            # Same #77 structure as the Bambu automation: flush to a known slot
+            # (from-state, or the helper on cross-slot recovery), reset only on
+            # a known slot going inactive with nothing to flush, and PRESERVE
+            # the meter on ''-blip arrivals.
             - choose:
                 - conditions:
                     - condition: template
-                      value_template: "{{ old_tray >= 0 and tray_usage_cm >= 0.01 and tray_sensor != '' }}"
+                      value_template: >-
+                        {{ tray_composite >= 0 and tray_usage_cm >= 0.01 and tray_sensor != ''
+                           and (old_tray >= 0 or (new_tray >= 0 and new_tray != tray_composite)) }}
                   sequence:
                     - action: system_log.write
                       data:
                         message: >-
                           SPOOLMANSYNC TRAY CHANGE (Creality) | Old tray {{ old_tray }} -> New tray {{ new_tray }} |
+                          Flush tray {{ tray_composite }} |
                           Sensor: {{ tray_sensor }} |
                           Spool: {{ name }} ({{ material }}) |
                           Length used: {{ tray_usage_cm }}cm |
-                          RFID: {{ tray_uuid }}
+                          Material code: {{ material_code }}
                         level: info
                     - action: rest_command.spoolmansync_update_spool
                       data:
                         filament_name: "{{ name }}"
                         filament_material: "{{ material }}"
-                        filament_tray_uuid: "{{ tray_uuid }}"
+                        # Creality reports no per-spool serial — see material_code above.
+                        filament_tray_uuid: ""
                         filament_used_length: "{{ tray_usage_cm }}"
                         filament_color: "{{ color }}"
                         filament_active_tray_id: "{{ tray_sensor }}"
+                    - action: utility_meter.calibrate
+                      target:
+                        entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
+                      data:
+                        value: "0"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ old_tray >= 0 }}"
+                  sequence:
+                    - action: system_log.write
+                      data:
+                        message: >-
+                          SPOOLMANSYNC TRAY CHANGE (Creality, no usage logged) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                          Length: {{ tray_usage_cm }}cm |
+                          Reason: {{ 'no length to log' if tray_usage_cm < 0.01 else 'slot sensor not found' }}
+                        level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'debug' }}"
                     - action: utility_meter.calibrate
                       target:
                         entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
@@ -545,15 +806,9 @@ function generateCrealityAutomationsYaml(
                 - action: system_log.write
                   data:
                     message: >-
-                      SPOOLMANSYNC TRAY CHANGE (Creality, no usage logged) | Old: {{ old_tray }} -> New: {{ new_tray }} |
-                      Length: {{ tray_usage_cm }}cm |
-                      Reason: {{ 'old_tray invalid' if old_tray < 0 else 'no length to log' }}
-                    level: debug
-                - action: utility_meter.calibrate
-                  target:
-                    entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
-                  data:
-                    value: "0"
+                      SPOOLMANSYNC TRAY CHANGE (Creality, meter preserved) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                      Length: {{ tray_usage_cm }}cm | Last tray: {{ helper_tray }}
+                    level: info
             - condition: template
               value_template: "{{ new_tray >= 0 }}"
             - action: input_number.set_value
@@ -568,13 +823,19 @@ function generateCrealityAutomationsYaml(
 
         # =====================================================================
         # PRINT END - Log final tray usage from helper
+        #
+        # 'off'/'offline' deliberately NOT excluded from from_state — kept in
+        # step with the Bambu automation (#75 follow-up). ha_creality_ws
+        # surfaces disconnects as 'unavailable' (still excluded), so this is
+        # symmetry rather than a live fix; the #66 guards (meter zeroed after
+        # every flush and on sustained offline) hold here identically.
         # =====================================================================
         - conditions:
             - condition: template
               value_template: >-
                 {{ trigger.id == 'print_end'
                    and trigger.from_state is not none
-                   and trigger.from_state.state not in ['unavailable', 'unknown', 'idle', 'completed', 'off'] }}
+                   and trigger.from_state.state not in ['unavailable', 'unknown', 'idle', 'completed', 'none'] }}
           sequence:
             - choose:
                 - conditions:
@@ -588,13 +849,14 @@ function generateCrealityAutomationsYaml(
                           Sensor: {{ tray_sensor }} |
                           Spool: {{ name }} ({{ material }}) |
                           Length used: {{ tray_usage_cm }}cm |
-                          RFID: {{ tray_uuid }}
+                          Material code: {{ material_code }}
                         level: info
                     - action: rest_command.spoolmansync_update_spool
                       data:
                         filament_name: "{{ name }}"
                         filament_material: "{{ material }}"
-                        filament_tray_uuid: "{{ tray_uuid }}"
+                        # Creality reports no per-spool serial — see material_code above.
+                        filament_tray_uuid: ""
                         filament_used_length: "{{ tray_usage_cm }}"
                         filament_color: "{{ color }}"
                         filament_active_tray_id: "{{ tray_sensor }}"
@@ -604,7 +866,9 @@ function generateCrealityAutomationsYaml(
                     message: >-
                       SPOOLMANSYNC PRINT END (Creality, skipped) | Tray: {{ tray_composite }} | Length: {{ tray_usage_cm }}cm |
                       Reason: {{ 'no tray in helper' if tray_composite < 0 else 'no length' }}
-                    level: warning
+                    # Quiet on a benign power-on (empty meter); warn when real
+                    # length is discarded (#78).
+                    level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'info' }}"
             - action: utility_meter.calibrate
               target:
                 entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
@@ -613,6 +877,52 @@ function generateCrealityAutomationsYaml(
             - action: system_log.write
               data:
                 message: "SPOOLMANSYNC METER RESET after print end (Creality)"
+                level: info
+
+        # =====================================================================
+        # PRINTER OFFLINE - Bank the usage, THEN reset the meter. cm-based
+        # mirror of the Bambu path; see there for the full rationale (#78).
+        # =====================================================================
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'offline' }}"
+          sequence:
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ tray_composite >= 0 and tray_usage_cm >= 0.01 and tray_sensor != '' }}"
+                  sequence:
+                    - action: system_log.write
+                      data:
+                        message: >-
+                          SPOOLMANSYNC OFFLINE FLUSH (Creality) | Tray {{ tray_composite }} |
+                          Sensor: {{ tray_sensor }} |
+                          Length used: {{ tray_usage_cm }}cm
+                        level: info
+                    - action: rest_command.spoolmansync_update_spool
+                      data:
+                        filament_name: "{{ name }}"
+                        filament_material: "{{ material }}"
+                        # Creality reports no per-spool serial — see material_code above.
+                        filament_tray_uuid: ""
+                        filament_used_length: "{{ tray_usage_cm }}"
+                        filament_color: "{{ color }}"
+                        filament_active_tray_id: "{{ tray_sensor }}"
+              default:
+                - action: system_log.write
+                  data:
+                    message: >-
+                      SPOOLMANSYNC OFFLINE FLUSH (Creality, skipped) | Tray: {{ tray_composite }} | Length: {{ tray_usage_cm }}cm |
+                      Reason: {{ 'no tray in helper' if tray_composite < 0 else 'no length' if tray_usage_cm < 0.01 else 'tray sensor not found' }}
+                    level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'info' }}"
+            - action: utility_meter.calibrate
+              target:
+                entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
+              data:
+                value: "0"
+            - action: system_log.write
+              data:
+                message: "SPOOLMANSYNC METER RESET (printer offline) | ${prefix}"
                 level: info
   mode: single
 
@@ -640,7 +950,8 @@ ${trayEntityIds.map(id => `        - ${id}`).join('\n')}
            trigger.to_state.attributes.get('name', '') != trigger.from_state.attributes.get('name', '') }}
   variables:
     tray_entity_id: "{{ trigger.entity_id }}"
-    tray_uuid: "{{ state_attr(trigger.entity_id, 'rfid') | default('') }}"
+    # Material-type code, logged for diagnostics only — never a spool serial.
+    material_code: "{{ state_attr(trigger.entity_id, 'rfid') | default('') }}"
     name: "{{ state_attr(trigger.entity_id, 'name') | default('') }}"
     material: "{{ state_attr(trigger.entity_id, 'type') | default('') }}"
     color: "{{ state_attr(trigger.entity_id, 'color_hex') | default('') }}"
@@ -650,15 +961,20 @@ ${trayEntityIds.map(id => `        - ${id}`).join('\n')}
         message: >-
           SPOOLMANSYNC TRAY CHANGE DETECTED (Creality) | {{ tray_entity_id }} |
           Name: {{ name }} | Material: {{ material }} |
-          RFID: {{ tray_uuid }} | Color: {{ color }}
+          Material code: {{ material_code }} | Color: {{ color }}
         level: info
     - action: rest_command.spoolmansync_tray_change
       data:
         tray_entity_id: "{{ tray_entity_id }}"
-        tray_uuid: "{{ tray_uuid }}"
+        # Empty on purpose: no per-spool serial exists for Creality, so serial
+        # auto-matching stays off rather than matching on a material code.
+        tray_uuid: ""
         name: "{{ name }}"
         material: "{{ material }}"
         color: "{{ color }}"
+        current_print_state: ${entities.current_stage
+          ? `"{{ states('${entities.current_stage}') }}"`
+          : `"unknown"  # no print-stage entity discovered`}
   mode: queued
   max: 10
 `;
@@ -717,31 +1033,78 @@ function buildActiveTrayDetection(allTrays: TrayInfo[], brand: 'bambu_lab' | 'cr
 }
 
 /**
+ * Placeholder for the filament-usage sensor when the entity it would be computed
+ * from doesn't exist in Home Assistant.
+ *
+ * The sensor is still declared so the utility_meter's `source:` resolves and the
+ * rest of the config loads unchanged, but it is permanently unavailable and says
+ * why — instead of a template that silently errors on every state change.
+ */
+function unavailableUsageSensor(prefix: string, missing: string[]): string {
+  return `      # ${prefix}: FILAMENT USAGE TRACKING IS DISABLED
+      #
+      # SpoolmanSync could not find this printer's ${missing.join(' / ')} entity in
+      # Home Assistant, and filament usage cannot be calculated without it. This
+      # sensor is intentionally unavailable so the rest of the config still loads;
+      # spool assignment and tray-change detection are unaffected, but no weight
+      # will be deducted from Spoolman.
+      #
+      # If your printer does expose an equivalent sensor, please report it at
+      # https://github.com/gibz104/SpoolmanSync/issues so it can be discovered.
+      - name: "SpoolmanSync ${prefix} Filament Usage"
+        unique_id: spoolmansync-${prefix}-filament-usage
+        state: "0"
+        availability: "{{ false }}"`;
+}
+
+/**
  * Generate configuration.yaml additions for all printers
  * Aggregates entries under single YAML top-level keys (no duplicate keys)
  */
 function generateConfigurationAdditions(
   printerConfigs: PrinterConfig[],
-  spoolmanUrl: string
+  spoolmanUrl: string,
+  webhookSecret: string = ''
 ): string {
+  const secretHeader = webhookSecret ? `\n      X-SpoolmanSync-Token: "${webhookSecret}"` : '';
   const printerList = printerConfigs.map(p => p.prefix).join(', ');
   const totalTrays = printerConfigs.reduce((sum, p) => sum + p.allTrays.length, 0);
 
-  // Build per-printer input_number entries
+  // Build per-printer input_number entries.
+  //
+  // Printers with AMS/CFS trays start the helper at -1 ("no tray known yet") so
+  // a fresh install can't flush usage to composite 0 — the external spool — by
+  // default (#77). External-spool-only printers must keep min 0: their
+  // active-tray sensor never changes state (single constant slot, or the
+  // virtual slot with no backing entity, #68), so the helper is never written
+  // and 0 is the only value that lets print_end flush their one slot. Existing
+  // installs are unaffected either way: input_number restores its last value
+  // when it is within the new min/max range.
   const inputNumberEntries = printerConfigs.map(p => {
     const maxCompositeId = Math.max(...p.allTrays.map(t => t.compositeId), 99);
+    const minValue = p.allTrays.some(t => t.amsNumber > 0) ? -1 : 0;
     return `  spoolmansync_${p.prefix}_last_tray:
     name: "SpoolmanSync ${p.prefix} Last Tray"
-    min: 0
+    min: ${minValue}
     max: ${maxCompositeId}
     step: 1`;
   }).join('\n');
 
   // Build per-printer utility_meter entries
+  //
+  // always_available is REQUIRED, not cosmetic. By default a utility_meter goes
+  // unavailable whenever its source does, and the source (the usage template
+  // sensor) goes unavailable the moment the printer drops off. The automation
+  // reads the meter through a float(0) fallback, so an unavailable meter reads
+  // as 0g — which would make the offline flush deduct nothing (#78). With this
+  // set the meter keeps its value and stays readable while the printer is away.
+  // It does not change how the meter counts: accumulation still stops while the
+  // source is unavailable, and the gap is skipped rather than re-added (#75).
   const utilityMeterEntries = printerConfigs.map(p =>
     `  spoolmansync_${p.prefix}_filament_usage_meter:
     unique_id: spoolmansync-${p.prefix}-filament-usage-meter
-    source: sensor.spoolmansync_${p.prefix}_filament_usage`
+    source: sensor.spoolmansync_${p.prefix}_filament_usage
+    always_available: true`
   ).join('\n');
 
   // Build per-printer template sensor entries (filament usage + active tray)
@@ -749,28 +1112,49 @@ function generateConfigurationAdditions(
     const activeTrayDetection = buildActiveTrayDetection(p.allTrays, p.brand);
     const availabilityEntities = p.allTrays.map(t => `'${t.entityId}'`);
 
-    // Filament usage sensor differs by brand
+    // Filament usage sensor differs by brand.
+    //
+    // IMPORTANT: never interpolate an empty entity_id here. When discovery can't
+    // find a printer-level entity it used to yield `states('')`, which produces a
+    // template that errors on every evaluation, leaves the sensor unavailable,
+    // and therefore leaves the utility_meter at 0 forever — so no usage webhook
+    // is ever sent, with no signal anywhere that this is what happened. We now
+    // emit an explicitly-unavailable sensor that names the missing entity.
     let filamentUsageSensor: string;
     if (p.brand === 'creality') {
       // Creality: used_material_length is a running total in cm
-      filamentUsageSensor = `      # ${p.prefix}: Track filament usage during print (Creality - cm)
+      filamentUsageSensor = p.discoveredEntities.used_material_length
+        ? `      # ${p.prefix}: Track filament usage during print (Creality - cm)
       - name: "SpoolmanSync ${p.prefix} Filament Usage"
         unique_id: spoolmansync-${p.prefix}-filament-usage
         unit_of_measurement: "cm"
         state: >
           {{ states('${p.discoveredEntities.used_material_length}') | float(0) }}
         availability: >
-          {{ states('${p.discoveredEntities.used_material_length}') not in ['unknown', 'unavailable'] }}`;
+          {{ states('${p.discoveredEntities.used_material_length}') not in ['unknown', 'unavailable'] }}`
+        : unavailableUsageSensor(p.prefix, ['used_material_length']);
     } else {
       // Bambu: calculate from print_weight * progress
-      filamentUsageSensor = `      # ${p.prefix}: Calculate filament usage during print
+      const missingForUsage = [
+        !p.discoveredEntities.print_weight ? 'print_weight' : null,
+        !p.discoveredEntities.print_progress ? 'print_progress' : null,
+      ].filter((v): v is string => v !== null);
+
+      filamentUsageSensor = missingForUsage.length === 0
+        ? `      # ${p.prefix}: Calculate filament usage during print
       - name: "SpoolmanSync ${p.prefix} Filament Usage"
         unique_id: spoolmansync-${p.prefix}-filament-usage
         state: >
           {{ states('${p.discoveredEntities.print_weight}') | float(0) / 100 *
              states('${p.discoveredEntities.print_progress}') | float(0) }}
+        # Availability must cover BOTH inputs. If print_progress flickers
+        # unavailable alone, float(0) makes this a VALID 0: the utility meter
+        # discards the dip but re-adds the recovery climb, over-counting usage.
+        # Going unavailable instead makes the meter skip the gap cleanly (#75).
         availability: >
-          {{ states('${p.discoveredEntities.print_weight}') not in ['unknown', 'unavailable'] }}`;
+          {{ states('${p.discoveredEntities.print_weight}') not in ['unknown', 'unavailable']
+             and states('${p.discoveredEntities.print_progress}') not in ['unknown', 'unavailable'] }}`
+        : unavailableUsageSensor(p.prefix, missingForUsage);
     }
 
     const unitLabel = p.brand === 'creality' ? 'CFS slot' : 'AMS tray';
@@ -814,7 +1198,7 @@ rest_command:
     url: "${spoolmanUrl}"
     method: POST
     headers:
-      Content-Type: "application/json"
+      Content-Type: "application/json"${secretHeader}
     payload: >
       {
         "event": "spool_usage",
@@ -831,7 +1215,7 @@ rest_command:
     url: "${spoolmanUrl}"
     method: POST
     headers:
-      Content-Type: "application/json"
+      Content-Type: "application/json"${secretHeader}
     payload: >
       {
         "event": "tray_change",
@@ -839,7 +1223,8 @@ rest_command:
         "tray_uuid": "{{ tray_uuid }}",
         "name": "{{ name }}",
         "material": "{{ material }}",
-        "color": "{{ color }}"
+        "color": "{{ color }}",
+        "current_print_state": "{{ current_print_state }}"
       }
 
 # Template sensors for filament tracking
@@ -924,11 +1309,31 @@ export interface PackagesConfig {
 }
 
 /**
+ * Normalize lines for PARSING ONLY: strip a UTF-8 BOM from the first line and a
+ * trailing \r from every line.
+ *
+ * Real-world configuration.yaml files are frequently CRLF (edited on Windows
+ * over Samba) or carry a BOM. The parsing regexes here use `.` and `$`, neither
+ * of which tolerates a trailing \r — which made an existing
+ * `packages: !include_dir_named <dir>` line invisible and led auto-configure to
+ * insert a DUPLICATE packages: key, silently breaking the user's setup
+ * (issue #73). Indices into the returned array align 1:1 with the original
+ * lines, so callers parse the normalized copy and splice into the original.
+ */
+function normalizeConfigLines(lines: string[]): string[] {
+  return lines.map((line, i) => {
+    let normalized = i === 0 && line.charCodeAt(0) === 0xfeff ? line.slice(1) : line;
+    if (normalized.endsWith('\r')) normalized = normalized.slice(0, -1);
+    return normalized;
+  });
+}
+
+/**
  * Detect how packages are configured in configuration.yaml.
  * Parses as text (not YAML) since !include directives aren't standard YAML.
  */
 export function detectPackagesConfig(configContent: string): PackagesConfig {
-  const lines = configContent.split('\n');
+  const lines = normalizeConfigLines(configContent.split('\n'));
 
   // Find the homeassistant: block and packages: line within it
   let inHomeassistant = false;
@@ -961,21 +1366,32 @@ export function detectPackagesConfig(configContent: string): PackagesConfig {
     const packagesIndent = currentIndent;
     const restOfLine = packagesMatch[1].trim();
 
-    // Style B: !include_dir_named or !include_dir_merge_named
-    const dirMatch = restOfLine.match(/^!include_dir_(?:named|merge_named)\s+(.+)$/);
+    // Style B: !include_dir_named or !include_dir_merge_named.
+    // Tolerate a trailing comment and surrounding quotes on the path — both are
+    // valid in HA configs, and capturing them verbatim previously sent the
+    // package file into a directory HA never loads.
+    const dirMatch = restOfLine.match(/^!include_dir_(?:named|merge_named)\s+([^#]+?)\s*(?:#.*)?$/);
     if (dirMatch) {
-      return {
-        style: 'directory',
-        directoryPath: dirMatch[1].trim(),
-      };
+      // Normalize the spelling: strip quotes, a leading './' and trailing
+      // slashes. 'packages/', './packages' and 'packages' are the same
+      // directory, and callers compare the resulting file path against other
+      // paths — a cosmetic spelling difference must not defeat that.
+      const directoryPath = dirMatch[1]
+        .trim()
+        .replace(/^(['"])(.*)\1$/, '$2')
+        .replace(/^\.\//, '')
+        .replace(/\/+$/, '');
+      return { style: 'directory', directoryPath };
     }
 
     // Style C (or A with no value): named entries on subsequent lines
     // Scan forward to find entries and the end of the packages block
-    const entryIndentLevel = packagesIndent + 2;
-    const entryIndent = ' '.repeat(entryIndentLevel);
     let lastEntryEndIndex = i; // default: right after packages: line
     let hasSpoolmansync = false;
+    // Match the indentation of the entries that actually exist — assuming
+    // packagesIndent+2 misindents the inserted entry (and breaks the YAML)
+    // for configs indented with 4 spaces or tabs.
+    let observedEntryIndent: string | null = null;
 
     for (let j = i + 1; j < lines.length; j++) {
       const entryLine = lines[j];
@@ -994,12 +1410,17 @@ export function detectPackagesConfig(configContent: string): PackagesConfig {
 
       // This line is inside the packages block
       lastEntryEndIndex = j;
+      if (observedEntryIndent === null) {
+        observedEntryIndent = entryLine.slice(0, entryCurrentIndent);
+      }
 
       // Check for existing spoolmansync entry
       if (entryTrimmed.startsWith('spoolmansync:') || entryTrimmed.startsWith('spoolmansync :')) {
         hasSpoolmansync = true;
       }
     }
+
+    const entryIndent = observedEntryIndent ?? ' '.repeat(packagesIndent + 2);
 
     // If rest of line is empty and no entries found → treat as 'none' (empty packages block)
     if (!restOfLine && lastEntryEndIndex === i) {
@@ -1017,24 +1438,109 @@ export function detectPackagesConfig(configContent: string): PackagesConfig {
   return { style: 'none' };
 }
 
+/** The exact directive line SpoolmanSync inserts. Also matched by the repair helper. */
+export const SPOOLMANSYNC_PACKAGES_DIRECTIVE = '  packages: !include_dir_named packages';
+
+export interface AddDirectiveResult {
+  content: string;
+  /** Human-readable reason the directive was NOT added; null on success. */
+  conflict: string | null;
+}
+
 /**
  * Add `packages: !include_dir_named packages` under homeassistant: in configuration.yaml.
  * If homeassistant: doesn't exist, adds it at the top.
+ *
+ * REFUSES (returns a conflict instead of inserting) when the homeassistant:
+ * block already contains a packages: key in any form, or when homeassistant: has
+ * a scalar value (e.g. `homeassistant: !include x.yaml`) that a child key can't
+ * be nested under. Inserting anyway used to create a duplicate packages: key;
+ * YAML keeps the last one, so the SpoolmanSync package silently never loaded
+ * while every check reported success (issue #73). A loud failure the user can
+ * act on beats a silent misconfiguration.
  */
-export function addPackagesDirective(configContent: string): string {
-  const lines = configContent.split('\n');
+export function addPackagesDirective(configContent: string): AddDirectiveResult {
+  const rawLines = configContent.split('\n');
+  const lines = normalizeConfigLines(rawLines);
 
-  // Find homeassistant: line
   for (let i = 0; i < lines.length; i++) {
-    if (/^homeassistant\s*:/.test(lines[i].trimStart()) && (lines[i].length - lines[i].trimStart().length) === 0) {
-      // Insert packages directive after homeassistant: line
-      lines.splice(i + 1, 0, '  packages: !include_dir_named packages');
-      return lines.join('\n');
+    const trimmed = lines[i].trimStart();
+    const match = trimmed.match(/^homeassistant\s*:(.*)$/);
+    if (!match || (lines[i].length - trimmed.length) !== 0) continue;
+
+    const value = match[1].replace(/#.*$/, '').trim();
+    if (value) {
+      return {
+        content: configContent,
+        conflict: `configuration.yaml has "homeassistant: ${value}" — its settings live in another file, so SpoolmanSync cannot add a packages entry under it automatically`,
+      };
     }
+
+    // Scan the homeassistant: block for an existing packages: key.
+    for (let j = i + 1; j < lines.length; j++) {
+      const blockTrimmed = lines[j].trimStart();
+      const blockIndent = lines[j].length - blockTrimmed.length;
+      if (blockTrimmed && !blockTrimmed.startsWith('#') && blockIndent === 0) break; // left the block
+      if (/^packages\s*:/.test(blockTrimmed)) {
+        return {
+          content: configContent,
+          conflict: 'configuration.yaml already has a packages: entry under homeassistant: that SpoolmanSync could not use',
+        };
+      }
+    }
+
+    // Insert packages directive after homeassistant: line
+    rawLines.splice(i + 1, 0, SPOOLMANSYNC_PACKAGES_DIRECTIVE);
+    return { content: rawLines.join('\n'), conflict: null };
   }
 
   // No homeassistant: key found — add it at the top
-  return 'homeassistant:\n  packages: !include_dir_named packages\n\n' + configContent;
+  return {
+    content: `homeassistant:\n${SPOOLMANSYNC_PACKAGES_DIRECTIVE}\n\n` + configContent,
+    conflict: null,
+  };
+}
+
+/**
+ * Repair the broken state issue #73 left behind: a SpoolmanSync-inserted
+ * packages: directive sitting in the same homeassistant: block as the user's
+ * own packages: line (duplicate key; YAML keeps the user's, ours never loads).
+ *
+ * Deliberately narrow: removes ONLY the exact literal SpoolmanSync inserts, and
+ * only when at least one OTHER packages: line exists in the same block. A lone
+ * packages: line is never touched, whoever wrote it.
+ */
+export function repairDuplicatePackagesDirective(configContent: string): { content: string; repaired: boolean } {
+  const rawLines = configContent.split('\n');
+  const lines = normalizeConfigLines(rawLines);
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart();
+    if (!/^homeassistant\s*:/.test(trimmed) || (lines[i].length - trimmed.length) !== 0) continue;
+
+    const ourLineIndexes: number[] = [];
+    let otherPackagesLines = 0;
+    for (let j = i + 1; j < lines.length; j++) {
+      const blockTrimmed = lines[j].trimStart();
+      const blockIndent = lines[j].length - blockTrimmed.length;
+      if (blockTrimmed && !blockTrimmed.startsWith('#') && blockIndent === 0) break;
+      if (!/^packages\s*:/.test(blockTrimmed)) continue;
+      if (lines[j] === SPOOLMANSYNC_PACKAGES_DIRECTIVE) {
+        ourLineIndexes.push(j);
+      } else {
+        otherPackagesLines++;
+      }
+    }
+
+    if (ourLineIndexes.length > 0 && otherPackagesLines > 0) {
+      for (let k = ourLineIndexes.length - 1; k >= 0; k--) {
+        rawLines.splice(ourLineIndexes[k], 1);
+      }
+      return { content: rawLines.join('\n'), repaired: true };
+    }
+  }
+
+  return { content: configContent, repaired: false };
 }
 
 /**

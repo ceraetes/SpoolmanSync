@@ -16,10 +16,14 @@ export function QRScanner({ onScan, onError }: QRScannerProps) {
   const [camerasLoaded, setCamerasLoaded] = useState(false);
   const scannerRef = useRef<Html5Qrcode | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const isMountedRef = useRef(true);
 
-  // Cleanup on unmount
+  // Track mounted state and clean up on unmount. A fast navigate-away during
+  // async camera startup could otherwise leak the camera stream.
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       stopScanning();
     };
   }, []);
@@ -80,6 +84,13 @@ export function QRScanner({ onScan, onError }: QRScannerProps) {
         }
       );
 
+      // If the component unmounted while start() was awaiting (fast
+      // navigate-away), immediately tear down so the camera stream isn't leaked.
+      if (!isMountedRef.current) {
+        stopScanning();
+        return;
+      }
+
       setIsScanning(true);
     } catch (err) {
       console.error('Error starting scanner:', err);
@@ -88,13 +99,17 @@ export function QRScanner({ onScan, onError }: QRScannerProps) {
   };
 
   const stopScanning = async () => {
-    if (scannerRef.current?.isScanning) {
+    // Always attempt to stop the scanner regardless of the isScanning flag.
+    // Html5Qrcode.stop() throws harmlessly when not running, so guarding on
+    // isScanning could leak a stream that started after the flag was read.
+    if (scannerRef.current) {
       try {
         await scannerRef.current.stop();
         scannerRef.current.clear();
       } catch (err) {
         console.error('Error stopping scanner:', err);
       }
+      scannerRef.current = null;
     }
     setIsScanning(false);
   };

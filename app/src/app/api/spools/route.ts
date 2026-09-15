@@ -5,6 +5,7 @@ import { HomeAssistantClient } from '@/lib/api/homeassistant';
 import { createActivityLog } from '@/lib/activity-log';
 import { getBambuAmsPushSettings } from '@/lib/bambu-ams-settings';
 import { tryPushSpoolToAms } from '@/lib/bambu-ams-push';
+import { applyLocationSync } from '@/lib/spool-location';
 
 export async function GET() {
   try {
@@ -32,6 +33,14 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { spoolId, trayId, bambuTrayInfoIdx } = body;
 
+    // Validate inputs before touching Spoolman to avoid malformed requests / 500s
+    if (typeof spoolId !== 'number' || !Number.isFinite(spoolId)) {
+      return NextResponse.json({ error: 'spoolId is required and must be a number' }, { status: 400 });
+    }
+    if (typeof trayId !== 'string' || trayId.trim() === '') {
+      return NextResponse.json({ error: 'trayId is required and must be a non-empty string' }, { status: 400 });
+    }
+
     const spoolmanConnection = await prisma.spoolmanConnection.findFirst();
 
     if (!spoolmanConnection) {
@@ -52,6 +61,10 @@ export async function POST(request: NextRequest) {
       }
       return entityIdMap.get(entityId) || entityId;
     });
+
+    // Location sync (no-op unless enabled) — keep Spoolman's location field in
+    // step with the tray this spool is being assigned to.
+    await applyLocationSync(client);
 
     let updatedSpool = await client.assignSpoolToTray(spoolId, trayId);
 
@@ -111,6 +124,11 @@ export async function DELETE(request: NextRequest) {
     const body = await request.json();
     const { spoolId } = body;
 
+    // Validate inputs before touching Spoolman to avoid malformed requests / 500s
+    if (typeof spoolId !== 'number' || !Number.isFinite(spoolId)) {
+      return NextResponse.json({ error: 'spoolId is required and must be a number' }, { status: 400 });
+    }
+
     const spoolmanConnection = await prisma.spoolmanConnection.findFirst();
 
     if (!spoolmanConnection) {
@@ -131,6 +149,10 @@ export async function DELETE(request: NextRequest) {
       }
       return deleteEntityIdMap.get(entityId) || entityId;
     });
+
+    // Location sync (no-op unless enabled) — the guarded clear/holding-pen write
+    // in unassignSpoolFromTray only applies if we set the location.
+    await applyLocationSync(client);
 
     const updatedSpool = await client.unassignSpoolFromTray(spoolId);
 

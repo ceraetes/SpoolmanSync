@@ -70,7 +70,10 @@ export async function getActiveAlerts(): Promise<ActiveAlert[]> {
   const setting = await prisma.settings.findUnique({ where: { key: SETTINGS_KEY_ALERTS } });
   if (!setting) return [];
   try {
-    return JSON.parse(setting.value);
+    const parsed = JSON.parse(setting.value);
+    // Stored value must be an array of alerts; anything else is corrupt.
+    if (!Array.isArray(parsed)) return [];
+    return parsed as ActiveAlert[];
   } catch {
     return [];
   }
@@ -168,7 +171,22 @@ function sanitizeForNotificationId(key: string): string {
   return key.replace(/[^a-z0-9_]/g, '_');
 }
 
-export async function checkAndUpdateAlerts(): Promise<ActiveAlert[]> {
+// Serializes all alert checks. The read (getActiveAlerts) and write
+// (saveActiveAlerts) are separated by external Spoolman/HA HTTP calls, so two
+// concurrent runs could read the same previous state and clobber each other's
+// diff. A DB transaction can't span those external calls, so we serialize at
+// the module level with a promise chain. Each run waits for the previous to
+// settle (success or failure) before starting.
+let alertChain: Promise<unknown> = Promise.resolve();
+
+export function checkAndUpdateAlerts(): Promise<ActiveAlert[]> {
+  const next = alertChain.then(runCheck, runCheck);
+  // Keep the chain alive regardless of this run's outcome.
+  alertChain = next.catch(() => {});
+  return next;
+}
+
+async function runCheck(): Promise<ActiveAlert[]> {
   const config = await getAlertConfig();
   const previousAlerts = await getActiveAlerts();
 

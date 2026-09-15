@@ -142,7 +142,7 @@ export async function GET(request: NextRequest) {
       bySpool.push({
         spoolId,
         spoolName: spool
-          ? `${spool.filament.vendor?.name ? spool.filament.vendor.name + ' ' : ''}${spool.filament.name || spool.filament.material}`
+          ? `${spool.filament.vendor?.name ? spool.filament.vendor.name + ' ' : ''}${spool.filament.name || spool.filament.material} #${spool.id}`
           : `Unknown Spool #${spoolId}`,
         material: spool?.filament.material || 'Unknown',
         vendor: spool?.filament.vendor?.name || 'Unknown',

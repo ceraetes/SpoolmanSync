@@ -11,6 +11,8 @@ import {
 } from '@/lib/api/homeassistant';
 import { createActivityLog } from '@/lib/activity-log';
 import { getBambuAmsPushSettings, saveBambuAmsPushSettings } from '@/lib/bambu-ams-settings';
+import { isWebhookAuthEnabled } from '@/lib/webhook-secret';
+import { UNASSIGNED_LOCATION_KEY, SPOOLMAN_LOCATION_MAX } from '@/lib/spool-location';
 
 export async function GET() {
   try {
@@ -51,6 +53,11 @@ export async function GET() {
       const qrBaseUrlSetting = await prisma.settings.findUnique({ where: { key: 'qr_base_url' } });
       const showLocationSetting = await prisma.settings.findUnique({ where: { key: 'show_spool_location' } });
       const bambuAmsPush = await getBambuAmsPushSettings();
+      const neverAutoClearSetting = await prisma.settings.findUnique({ where: { key: 'never_auto_clear_tray' } });
+      const ignoreColorSetting = await prisma.settings.findUnique({ where: { key: 'ignore_color_mismatch' } });
+      const syncLocationSetting = await prisma.settings.findUnique({ where: { key: 'sync_spoolman_location' } });
+      const unassignedLocationSetting = await prisma.settings.findUnique({ where: { key: UNASSIGNED_LOCATION_KEY } });
+      const webhookAuthEnabled = await isWebhookAuthEnabled();
 
       return NextResponse.json({
         embeddedMode: false,
@@ -67,6 +74,11 @@ export async function GET() {
         qrBaseUrl: qrBaseUrlSetting?.value || '',
         showSpoolLocation: showLocationSetting?.value === 'true',
         bambuAmsPush,
+        neverAutoClearTray: neverAutoClearSetting?.value === 'true',
+        ignoreColorMismatch: ignoreColorSetting?.value === 'true',
+        syncSpoolmanLocation: syncLocationSetting?.value === 'true',
+        unassignedSpoolLocation: unassignedLocationSetting?.value ?? '',
+        webhookConfigured: webhookAuthEnabled,
       });
     }
 
@@ -208,9 +220,12 @@ export async function GET() {
       if (adminCredsSetting) {
         try {
           const creds = JSON.parse(adminCredsSetting.value);
+          // Do NOT return the password here — it would be served to any client on
+          // every settings load. Expose only that a password exists; the UI fetches
+          // the actual password on explicit user action (POST type 'reveal_ha_password').
           adminCredentials = {
             username: creds.username,
-            password: creds.password,
+            hasPassword: !!creds.password,
           };
         } catch {
           console.error('Failed to parse admin credentials');
@@ -248,6 +263,11 @@ export async function GET() {
     const qrBaseUrlSetting = await prisma.settings.findUnique({ where: { key: 'qr_base_url' } });
     const showLocationSetting = await prisma.settings.findUnique({ where: { key: 'show_spool_location' } });
     const bambuAmsPush = await getBambuAmsPushSettings();
+    const neverAutoClearSetting = await prisma.settings.findUnique({ where: { key: 'never_auto_clear_tray' } });
+    const ignoreColorSetting = await prisma.settings.findUnique({ where: { key: 'ignore_color_mismatch' } });
+    const syncLocationSetting = await prisma.settings.findUnique({ where: { key: 'sync_spoolman_location' } });
+    const unassignedLocationSetting = await prisma.settings.findUnique({ where: { key: UNASSIGNED_LOCATION_KEY } });
+    const webhookAuthEnabled = await isWebhookAuthEnabled();
 
     return NextResponse.json({
       embeddedMode,
@@ -260,6 +280,11 @@ export async function GET() {
       qrBaseUrl: qrBaseUrlSetting?.value || '',
       showSpoolLocation: showLocationSetting?.value === 'true',
       bambuAmsPush,
+      neverAutoClearTray: neverAutoClearSetting?.value === 'true',
+      ignoreColorMismatch: ignoreColorSetting?.value === 'true',
+      syncSpoolmanLocation: syncLocationSetting?.value === 'true',
+      unassignedSpoolLocation: unassignedLocationSetting?.value ?? '',
+      webhookConfigured: webhookAuthEnabled,
     });
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -353,6 +378,84 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true });
     }
 
+    if (type === 'sync_spoolman_location') {
+      // When enabled, assigning a spool to a tray (real AMS/CFS or virtual
+      // printer) also writes Spoolman's native `location` field, and unassigning
+      // clears it (guarded so manual locations survive). Defaults off.
+      const enabled = body.enabled === true;
+      await prisma.settings.upsert({
+        where: { key: 'sync_spoolman_location' },
+        create: { key: 'sync_spoolman_location', value: String(enabled) },
+        update: { value: String(enabled) },
+      });
+      return NextResponse.json({ success: true });
+    }
+
+    if (type === 'unassigned_spool_location') {
+      // Optional "holding pen": where an unassigned spool's location goes
+      // instead of being cleared. Empty (the default) keeps the clear behavior.
+      // Only consulted while sync_spoolman_location is on — see
+      // getUnassignedLocation() — so it is inert on its own.
+      // Require an explicit string so a malformed request can't silently wipe a
+      // configured holding pen; clearing it is `location: ''`.
+      if (typeof body.location !== 'string') {
+        return NextResponse.json(
+          { error: 'location must be a string (use an empty string to clear it)' },
+          { status: 400 }
+        );
+      }
+      const location = body.location.trim().slice(0, SPOOLMAN_LOCATION_MAX);
+      await prisma.settings.upsert({
+        where: { key: UNASSIGNED_LOCATION_KEY },
+        create: { key: UNASSIGNED_LOCATION_KEY, value: location },
+        update: { value: location },
+      });
+      return NextResponse.json({ success: true, location });
+    }
+
+    if (type === 'never_auto_clear_tray') {
+      // When enabled, the webhook never auto-unassigns a spool on an empty-tray
+      // report (issue #65). Defaults off to preserve existing auto-clear behavior.
+      const enabled = body.enabled === true;
+      await prisma.settings.upsert({
+        where: { key: 'never_auto_clear_tray' },
+        create: { key: 'never_auto_clear_tray', value: String(enabled) },
+        update: { value: String(enabled) },
+      });
+      return NextResponse.json({ success: true });
+    }
+
+    if (type === 'ignore_color_mismatch') {
+      // Compare material only on the dashboard's "possible wrong spool" check.
+      // For tags that report a color the physical spool doesn't have, no Spoolman
+      // value can ever match, so the warning is otherwise unclearable (issue #79).
+      const enabled = body.enabled === true;
+      await prisma.settings.upsert({
+        where: { key: 'ignore_color_mismatch' },
+        create: { key: 'ignore_color_mismatch', value: String(enabled) },
+        update: { value: String(enabled) },
+      });
+      return NextResponse.json({ success: true });
+    }
+
+    if (type === 'reveal_ha_password') {
+      // Return the stored HA admin password only on explicit user action, rather
+      // than including it in every settings GET response (avoids passive exposure).
+      if (!isEmbeddedMode()) {
+        return NextResponse.json({ error: 'Not available in this mode' }, { status: 400 });
+      }
+      const adminCredsSetting = await prisma.settings.findUnique({ where: { key: 'ha_admin_credentials' } });
+      if (!adminCredsSetting) {
+        return NextResponse.json({ error: 'No admin credentials stored' }, { status: 404 });
+      }
+      try {
+        const creds = JSON.parse(adminCredsSetting.value);
+        return NextResponse.json({ username: creds.username, password: creds.password });
+      } catch {
+        return NextResponse.json({ error: 'Failed to read admin credentials' }, { status: 500 });
+      }
+    }
+
     if (type === 'qr_base_url') {
       // Save QR code base URL override
       const qrBaseUrl = (url || '').trim().replace(/\/+$/, '');
@@ -369,6 +472,11 @@ export async function POST(request: NextRequest) {
     }
 
     if (type === 'spoolman') {
+      // Validate input before constructing the client (avoid a 500 on bad input)
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        return NextResponse.json({ error: 'A Spoolman URL is required' }, { status: 400 });
+      }
+
       // Validate Spoolman connection
       const client = new SpoolmanClient(url);
       const isValid = await client.checkConnection();

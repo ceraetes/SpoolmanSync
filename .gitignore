@@ -1,6 +1,18 @@
 # IDE
 .idea/
 
+# Node / Next.js build output
+node_modules/
+.next/
+app/.next/
+
+# MCP / Playwright local artifacts
+.mcp-screenshots/
+.playwright-mcp/
+
+# Local scratch (issue-response drafts, etc.)
+response.txt
+
 # Development databases
 *.db
 *.db-journal

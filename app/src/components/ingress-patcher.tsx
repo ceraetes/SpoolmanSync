@@ -55,16 +55,17 @@ export function IngressPatcher({ ingressPath }: { ingressPath: string }) {
       return originalFetch.call(this, input, init);
     };
 
-    // Patch EventSource (used for SSE on dashboard/logs)
+    // Patch EventSource (used for SSE on dashboard/logs).
+    // Subclassing preserves the prototype chain and the inherited static
+    // constants (CONNECTING / OPEN / CLOSED) that code may reference, which a
+    // plain function wrapper + Object.assign would drop (those constants are
+    // non-enumerable own props on the native constructor).
     const OriginalEventSource = window.EventSource;
-    const PatchedEventSource = function (url: string | URL, config?: EventSourceInit) {
-      if (typeof url === 'string') {
-        url = rewriteUrl(url);
+    class PatchedEventSource extends OriginalEventSource {
+      constructor(url: string | URL, config?: EventSourceInit) {
+        super(typeof url === 'string' ? rewriteUrl(url) : url, config);
       }
-      return new OriginalEventSource(url, config);
-    };
-    Object.assign(PatchedEventSource, OriginalEventSource);
-    PatchedEventSource.prototype = OriginalEventSource.prototype;
+    }
     window.EventSource = PatchedEventSource as unknown as typeof EventSource;
 
     // Patch history.pushState and replaceState so Next.js router

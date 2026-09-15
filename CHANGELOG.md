@@ -5,6 +5,129 @@ All notable changes to SpoolmanSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.12] - 2026-09-09
+
+> Upgrade note: re-run Auto-configure / regenerate your Home Assistant automations, then **fully restart Home Assistant**. A reload is not enough this time, because the `utility_meter` definition itself changed.
+
+### Fixed
+- Filament used before a printer dropped off the network is no longer thrown away (#78). When a printer went offline for more than two minutes, the usage counter was reset to zero without ever deducting what it held, so everything used up to that point vanished. One user reconciled 105 g lost in a single overnight dropout against a physical weigh-in of the spool. The offline step now deducts the usage first and then resets. The reset is kept, because that is what stops a power-on from deducting the last print a second time.
+- Two other spots reset the counter without deducting, when a tray change or the end of a print could not work out which tray the filament belonged to. Those still reset, since holding on to grams we cannot attribute would only deduct them from the next spool, but they now log a warning instead of a debug message so the loss is visible instead of silent.
+
+## [1.6.11] - 2026-09-08
+
+> Upgrade note: re-run Auto-configure / regenerate your Home Assistant automations to pick up the Creality fixes below.
+
+### Fixed
+- Creality CFS spool colors were being read wrong, which made the dashboard's "possible wrong spool" warning show up on nearly every Creality spool and stay there for good (#79). Creality reports color as `#0rrggbb`, where the real RGB value is the last six characters rather than the first six. Every color except black was compared as a different color, so no value you could enter in Spoolman would ever match.
+- Creality spools are no longer matched by RFID serial, because the CFS does not report one. Its `rfid` attribute is Creality's material type code (PLA is 00001, PETG is 00003), which every spool of that material shares. Treating it as a unique serial could auto-assign whichever spool last carried that code, and could move the code from one spool to another on each print. Serial matching is now Bambu Lab only. Creality spools are matched by their tray assignment instead, which is how SpoolmanSync tracks every other brand of filament. Installs still running older automations are covered without regenerating them.
+
+### Added
+- New "Ignore color in spool mismatch warnings" setting under Settings, in the Dashboard Display section. The warning then compares material only, which helps if your RFID tags report a color the physical spool does not actually have. This is common with third-party Creality tags.
+
+## [1.6.10] - 2026-08-17
+
+### Security
+- Updated dependencies to resolve open security advisories. The main bumps are Next.js 16.1.6 to 16.3.1, ws 8.19 to 8.21.3, and the Prisma packages to 7.9.1, plus transitive patches to postcss, nanoid, sharp, and others. No app changes. Verified with the full test suite, production builds of both Docker images, and a live container smoke test.
+
+## [1.6.9] - 2026-08-17
+
+> Upgrade note: re-run Auto-configure / regenerate your Home Assistant automations to pick up the tracking fix below.
+
+### Fixed
+- Filament usage could be silently lost when the active tray sensor blipped through its empty idle state, which happens on every tray change and on brief connection hiccups (#77). The automation no longer resets the usage meter when a tray becomes active. A blip back to the same tray keeps counting, and a switch to a different tray first deducts the accumulated usage from the previous tray. Requires regenerating automations.
+
+### Added
+- Spoolman locations now follow a printer rename in Home Assistant. Renaming the device used to strand assigned spools in their old locations until each was re-assigned. The dashboard now migrates them automatically. Locations you set by hand are never touched.
+
+## [1.6.8] - 2026-08-03
+
+### Fixed
+- Add-on release notes now appear in Home Assistant (#76). The add-on's changelog file was a placeholder linking to the GitHub Releases page (which is empty, since releases are cut as git tags), so the update dialog and the add-on page's Changelog link never showed what changed — including upgrade notes like the recent "regenerate your automations" ones. Home Assistant reads the `CHANGELOG.md` next to the add-on's `config.yaml`, never GitHub releases or tags; that file is now a symlink to this changelog, so updates display the full release history.
+
+## [1.6.7] - 2026-07-28
+
+> Upgrade note: re-run Auto-configure / regenerate your Home Assistant automations to pick up this fix. Without regenerating, behavior is unchanged.
+
+### Fixed
+- Print-end deductions are no longer silently skipped when the printer's connection blips at print completion (follow-up to #75, reported on the forum with a Bambu X2D). Many Bambu printers briefly report `offline` for a few seconds right as a print finishes, so the stage arrives at `idle` from `offline` — a sequence the automation treated as a power-on and ignored, without logging anything. The power-on protection (#66) now rests entirely on the meter guards added in v1.6.6: the usage meter is zeroed after every flush and after a sustained two-minute offline, so a boot-time print-end fires with 0g and deducts nothing, while a genuine print end arriving via a brief offline blip now deducts normally. Two visible side effects: powering the printer on may log a harmless "SPOOLMANSYNC PRINT END (skipped)" info entry, and a quick (under two minutes) power loss mid-print now deducts the filament that was actually consumed before the outage instead of discarding it.
+
+## [1.6.6] - 2026-07-26
+
+> Upgrade note: existing users should re-run Auto-configure / regenerate their Home Assistant automations to pick up the filament-usage fix below. Without regenerating, behavior is unchanged (nothing breaks).
+
+### Added
+- Optional "location when unassigned" holding pen. With location sync enabled, a spool removed from a tray normally has its Spoolman `location` cleared, which makes it disappear from Spoolman's location views until you remember to file it. You can now set a location — e.g. "Holding Pen" — that unassigned spools are parked in instead. The field appears under the "Sync spool locations to Spoolman" toggle and is empty by default, preserving the existing clear-on-unassign behavior; it has no effect at all unless location sync is on. A location you set by hand is still never overwritten.
+
+### Fixed
+- Spoolman location suggestions are no longer stale. The pick-list offered when creating a virtual printer was derived only from locations already written on spools, and counted archived spools. As a result, locations created in Spoolman didn't appear until a spool was moved into them, and deleted locations lingered indefinitely whenever an archived spool still carried the name. SpoolmanSync now reads Spoolman's own `locations` setting first (preserving your ordering) and then adds any additional locations found on non-archived spools — the same list Spoolman's Locations page builds — so the two always agree. The Settings page also refreshes the list when the tab regains focus.
+- Missing Home Assistant entities no longer fail silently. When a printer-level entity such as `print_weight` couldn't be discovered, the generated configuration contained `states('')` — a template that errors on every evaluation, leaving the filament-usage sensor dead, the utility meter at zero, and no usage webhook ever sent, with the only trace a warning on the server console. SpoolmanSync now generates an explicitly unavailable sensor that names the missing entity, reports the problem in the Automations page (in every deployment mode) and the activity log, and keeps spool assignment and tray-change detection working. A missing print-stage entity no longer emits a blank trigger `entity_id` for Bambu or Creality printers, which previously made Home Assistant reject the entire automation — including the tray-change tracking that was otherwise unaffected. A printer discovered with no trays or external spools at all is now skipped rather than emitting an automation with an empty trigger list that would fail to load alongside every other printer in the same file.
+- Spool serial (RFID / `tray_uuid`) auto-matching is no longer defeated by formatting. Matching required an exact match on the raw stored value, so a serial entered by hand in Spoolman — stored bare rather than JSON-encoded, or differing only in case or whitespace — never matched, and the resulting log entry claimed no matching spool existed. Comparison is now normalized on both sides, without coercing numeric-looking serials.
+- The tray-change log entry no longer claims "no matching spool" when a spool is assigned. That check only ever looked up the tray's RFID serial, never the tray assignment, so it fired for any correctly-assigned spool that hadn't yet completed a tracked print — appearing to contradict the dashboard. The entry now states what was actually checked and records whether a spool remains assigned.
+- Fixed two false positives in the dashboard's "possible wrong spool" warning: a Spoolman colour stored with a leading `#` was compared against a stripped RFID colour and always flagged, and material variants such as `PLA+` and `PLA_Basic` were flagged against the printer's `PLA`. Genuinely different materials, including compound ones such as `PLA-CF`, are still flagged.
+- Filament usage is no longer under-counted when the printer's connection flickers mid-print (#75). The automation reset the usage meter every time the printer's stage touched `offline`, even for a seconds-long MQTT blip (common with a Panda Touch or other second client competing for the printer's connection slots). A print's deduction then covered only the filament used after the last blip — e.g. 17.7g logged for a 174.8g print. The meter is now only reset after the printer has been offline for a sustained period (2 minutes), so real power-offs still clear it (the protection added for #66) while brief flickers no longer destroy tracked usage. Also hardens the usage sensor's availability so a progress-sensor flicker cannot over-count. Requires regenerating automations to take effect.
+- Add-on auto-configure no longer breaks setups that already use Home Assistant packages (#73). The detection of an existing `packages:` entry in configuration.yaml failed on CRLF line endings (files edited on Windows over Samba), on a UTF-8 BOM, and on quoted paths or trailing comments — SpoolmanSync then inserted a second `packages:` key under `homeassistant:`. YAML keeps the last duplicate key, so the SpoolmanSync package was silently never loaded while everything reported success, and automations failed at runtime with "Action rest_command.spoolmansync_tray_change not found". Detection now handles all of these forms, auto-configure refuses with a clear error instead of ever inserting a duplicate, and it automatically repairs the duplicate-key state left behind by earlier versions (only ever removing the exact line SpoolmanSync itself inserted).
+- Connection failures during Home Assistant OAuth are no longer misreported as "OAuth authentication failed" when the real problem is that the SpoolmanSync container cannot reach Home Assistant at all (#74). Connecting now runs a quick reachability check before sending you to the Home Assistant login, and a network-level failure during token exchange is reported as exactly that, with a hint to check Docker networking.
+
+### Changed
+- External-mode setup instructions now require a full Home Assistant restart instead of offering "or reload automations". Reloading automations does not create the `input_number`, `utility_meter`, `template` and `rest_command` entries, which left tray-change detection working while filament usage was never deducted.
+
+## [1.6.5] - 2026-07-11
+
+### Added
+- Optional two-way sync between spool locations and Spoolman's native `location` field (opt-in; off by default). Enable "Sync spool locations to Spoolman" in Settings and:
+  - Assigning a spool to a real AMS/CFS tray sets its Spoolman location to `"<Printer> - <AMS> Tray <N>"` (or `"<Printer> - External"`), and assigning to a virtual printer (dry box/shelf) sets it to the virtual printer's name — so Spoolman reporting shows where every spool is, whether loaded in a printer or in storage.
+  - When creating a virtual printer, existing Spoolman locations are offered as a pick-list so names line up with the native location field.
+  - Unassigning a spool clears the location, but only when it still matches the label SpoolmanSync set — a location you set by hand is never overwritten. The feature is a no-op (and safe) when Home Assistant is unreachable, and only affects spools as they are assigned or unassigned.
+
+## [1.6.4] - 2026-07-11
+
+> Upgrade note: existing users should re-run Auto-configure / regenerate their Home Assistant automations so tray-change webhooks include the current print state. Without regenerating, the fix below stays inactive (behavior is unchanged, nothing breaks).
+
+### Fixed
+- Filament usage is no longer lost during an AMS runout / auto-refill mid-print (#71). When a tray ran empty while a print was still active, the ran-out spool could be auto-unassigned before its accumulated usage was flushed, so the deduction was dropped and only the replacement spool was charged. Tray-change events during an active print are now treated as possible runout transitions and the assignment is preserved, so the subsequent usage flush still matches and deducts from the correct spool. Empty-tray auto-clear continues to work as before when the printer is idle, finished, or offline.
+
+## [1.6.3] - 2026-06-25
+
+> Upgrade note (embedded mode): pull the latest images and recreate the containers, e.g. `docker compose pull && docker compose --profile embedded up -d`. On startup the bundled Home Assistant then refreshes ha-bambulab to the version shipped in the image.
+
+### Fixed
+- Embedded mode now keeps its bundled Home Assistant integrations up to date. Previously the bundled ha-bambulab was copied into the HA config only on first run and never refreshed, so existing embedded users stayed on an old version. The container now updates the bundled ha-bambulab (and ha_creality_ws) on startup whenever the image ships a newer version, without downgrading a newer copy or touching HACS-managed integrations. This delivers upstream ha-bambulab fixes, including the duplicate-AMS-device bug behind reports of phantom AMS HT units (#70).
+
+## [1.6.2] - 2026-06-23
+
+> Upgrade note: existing virtual-printer assignments migrate automatically the first time the dashboard or Settings page loads after updating — no manual steps required.
+
+### Fixed
+- Virtual-printer spool assignments now use a readable key in Spoolman — `virtual_<printer name>_tray_<N>`, matching the real-AMS key style — instead of the opaque `virtual:<uuid>:<uuid>` (#70). Existing assignments are migrated automatically. Renaming a virtual printer re-keys its assignments so none are lost, and virtual-printer names are now required to be unique.
+
+## [1.6.1] - 2026-06-19
+
+> Upgrade note: re-run **Auto-configure** (regenerate and re-apply the automations) and restart Home Assistant to pick up the updated tray trigger.
+
+### Fixed
+- Filament usage could be badly under-counted when the printer or MQTT connection briefly flickered mid-print (#69). A transient `unavailable` blip on the active-tray sensor was treated as a tray change by the Update Spool automation, which reset the usage meter and discarded the filament tracked so far (e.g. 2.3 g logged for a 25.6 g print). The tray trigger now ignores `unavailable`/`unknown` transitions on both Bambu and Creality printers.
+
+## [1.6.0] - 2026-06-19
+
+> Upgrade note: to apply the power-on and tray-clear fixes (#66, #65) and enable webhook authentication, re-run **Auto-configure** (regenerate and re-apply the automations) and restart Home Assistant. The other changes take effect on update alone.
+
+### Added
+- **Virtual printers** for dry boxes, filament dryers, and shelves (#67). Create them in Settings with assignable slots; they appear on the dashboard and support QR/NFC assignment like real trays, but are excluded from usage tracking. Deleting a printer or slot clears any spool assigned to it.
+- **Single-spool / non-AMS printer support** (#68). Printers without an AMS/CFS (e.g. Ender 3 V3 KE) now get an assignable external-spool slot so their filament can be tracked.
+- **Edit or delete usage events** from the Logs page to correct statistics (#54). By default this only adjusts SpoolmanSync's statistics; an opt-in option also adjusts the spool's remaining weight in Spoolman.
+- **Webhook authentication**: the Home Assistant webhook can require a generated shared-secret token, injected into the automations, preventing unauthenticated inventory changes from other devices on the network.
+- **"Never auto-clear tray assignments"** setting for setups with flaky AMS reporting (#65).
+- Unit test suite (Vitest) covering the filament-tracking logic.
+
+### Fixed
+- Filament usage is no longer deducted a second time when a printer is powered back on (#66). The print-completion automation now ignores the printer's offline state, and the usage meter resets when the printer goes offline.
+- Spool assignments are no longer cleared when the AMS briefly reports a tray as empty/unavailable during a reconnect (#65). The webhook ignores transient states and re-checks the live tray state before unassigning.
+- Usage-by-spool report no longer shows the same used weight for different spools that share a vendor and color (#64). Spool labels now include the Spoolman id to distinguish identical filaments.
+- The "Print Jobs" statistic counted every deduction event rather than prints; it is relabeled "Usage Events" to match the underlying data (#54).
+- Live updates now fall back to polling if the event stream drops after connecting; plus assorted resource-leak, race-condition, and component-lifecycle fixes.
+- Home Assistant token refresh now persists rotated refresh tokens and refreshes shortly before expiry.
+- The Home Assistant admin password is no longer returned by the settings API on every load; it is revealed only on explicit request.
+
 ## [1.5.3] - 2026-04-19
 
 ### Fixed

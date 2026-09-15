@@ -23,7 +23,7 @@ export function SummaryCards({ totalWeight, totalPrints, uniqueSpools }: Summary
       </Card>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-muted-foreground">Print Jobs</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Usage Events</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="text-2xl font-bold">{totalPrints}</div>
@@ -31,7 +31,7 @@ export function SummaryCards({ totalWeight, totalPrints, uniqueSpools }: Summary
       </Card>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-muted-foreground">Avg per Print</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Avg per Event</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="text-2xl font-bold">{avgPerPrint.toFixed(1)}g</div>

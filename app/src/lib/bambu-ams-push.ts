@@ -1,7 +1,7 @@
 import { HomeAssistantClient, HAPrinter, HATray } from '@/lib/api/homeassistant';
 import { Filament, parseExtraValue, Spool } from '@/lib/api/spoolman';
 import { BambuAmsPushSettings } from '@/lib/bambu-ams-settings';
-import { isValidTrayUuid } from '@/lib/tray-uuid';
+import { isValidTrayUuid } from '@/lib/webhook-helpers';
 
 export type AmsPushStatus =
   | 'pushed'

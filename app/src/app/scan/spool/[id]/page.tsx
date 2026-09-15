@@ -49,19 +49,34 @@ export default function SpoolAssignPage({
   }, []);
 
   useEffect(() => {
-    fetchData();
+    // Guard against setState-after-unmount and out-of-order responses: if the
+    // effect re-runs (id change) or the component unmounts, abort the in-flight
+    // fetches and ignore any late resolutions via the `active` flag.
+    const controller = new AbortController();
+    let active = true;
+
+    fetchData(controller.signal, () => active);
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  const fetchData = async () => {
+  const fetchData = async (signal?: AbortSignal, isActive: () => boolean = () => true) => {
     setLoading(true);
     setError(null);
 
     try {
       // Fetch spool and trays in parallel
       const [spoolsRes, printersRes] = await Promise.all([
-        fetch('/api/spools'),
-        fetch('/api/printers'),
+        fetch('/api/spools', { signal }),
+        fetch('/api/printers', { signal }),
       ]);
+
+      // Ignore stale/aborted responses (component unmounted or id changed)
+      if (!isActive()) return;
 
       if (!spoolsRes.ok) {
         if (spoolsRes.status === 400) {
@@ -74,6 +89,8 @@ export default function SpoolAssignPage({
       }
 
       const spoolsData = await spoolsRes.json();
+      if (!isActive()) return;
+
       const foundSpool = spoolsData.spools?.find(
         (s: Spool) => s.id.toString() === id
       );
@@ -89,6 +106,8 @@ export default function SpoolAssignPage({
       // Build tray options
       if (printersRes.ok) {
         const printersData = await printersRes.json();
+        if (!isActive()) return;
+
         const trayOptions: TrayOption[] = [];
 
         for (const printer of printersData.printers || []) {
@@ -115,9 +134,15 @@ export default function SpoolAssignPage({
         setTrays(trayOptions);
       }
     } catch (err) {
+      // A fetch abort surfaces as an AbortError — swallow it, it's expected on
+      // unmount / id change and must not flip the UI into an error state.
+      if (signal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+        return;
+      }
+      if (!isActive()) return;
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      setLoading(false);
+      if (isActive()) setLoading(false);
     }
   };
 

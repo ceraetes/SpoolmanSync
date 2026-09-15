@@ -73,7 +73,7 @@ export default function Dashboard() {
   // Track trays that have filament loaded but no spool assigned
   // Returns list with tray label and AMS-reported filament info
   const unassignedTrays = useMemo(() => {
-    const trays: { label: string; name?: string; material?: string; color?: string }[] = [];
+    const trays: { key: string; label: string; name?: string; material?: string; color?: string }[] = [];
     for (const printer of printers) {
       for (const ams of printer.ams_units) {
         for (const tray of ams.trays) {
@@ -87,6 +87,9 @@ export default function Dashboard() {
             const printerPrefix = printers.length > 1 ? `${printer.name} > ` : '';
             const amsPrefix = printer.ams_units.length > 1 ? `${ams.name} > ` : '';
             trays.push({
+              // Stable unique key: the tray entity_id, falling back to a
+              // printer+ams+tray composite if it's somehow missing.
+              key: tray.entity_id || `${printer.entity_id}:${ams.entity_id}:${tray.tray_number}`,
               label: `${printerPrefix}${amsPrefix}Tray ${tray.tray_number}`,
               name: tray.name,
               material: tray.material,
@@ -464,10 +467,10 @@ export default function Dashboard() {
                 <AlertTitle>Assign Spools to Trays</AlertTitle>
                 <AlertDescription>
                   <div className="space-y-1">
-                    {unassignedTrays.map((tray, i) => {
+                    {unassignedTrays.map((tray) => {
                       const details = [tray.material, tray.name].filter(Boolean).join(' - ');
                       return (
-                        <div key={i}>
+                        <div key={tray.key}>
                           <strong>{tray.label}</strong> has filament but no assigned spool.
                           {details && (
                             <span>

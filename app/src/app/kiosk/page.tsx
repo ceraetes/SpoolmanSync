@@ -41,10 +41,19 @@ export default function KioskPage() {
     setChecking(false);
   }, []);
 
-  // Keep input focused in kiosk idle mode
+  // Keep input focused in kiosk idle mode, but never steal focus while the
+  // user is actively interacting: skip if the input is already focused or if
+  // it already holds text the user is mid-typing. Only refocus when focus has
+  // genuinely been lost.
   useEffect(() => {
     if (!enabled) return;
-    const refocus = () => inputRef.current?.focus();
+    const refocus = () => {
+      const input = inputRef.current;
+      if (!input) return;
+      if (document.activeElement === input) return; // already focused
+      if (input.value) return; // user is mid-typing — don't interrupt
+      input.focus();
+    };
     refocus();
     const interval = setInterval(refocus, 1000);
     return () => clearInterval(interval);

@@ -4,12 +4,40 @@ import { HomeAssistantClient, isEmbeddedMode, isAddonMode } from '@/lib/api/home
 import {
   generateHAConfig, mergeConfiguration, mergeAutomations,
   detectPackagesConfig, addPackagesDirective, addPackageEntry,
+  repairDuplicatePackagesDirective,
   stripSpoolmanSyncConfig, toPackageFileContent,
+  type MissingEntityReport,
 } from '@/lib/ha-config-generator';
 import { createActivityLog } from '@/lib/activity-log';
 import { getHiddenPrinters } from '@/app/api/printers/setup/route';
+import { getOrCreateWebhookSecret, enableWebhookAuth } from '@/lib/webhook-secret';
 import * as fs from 'fs/promises';
 
+
+/**
+ * Record any printer-level entities discovery couldn't find.
+ *
+ * Without this the only trace is a console.warn on the server, so a printer whose
+ * `print_weight` is missing looks identical to a healthy one right up until the
+ * user notices weight is never deducted. Writing it to the activity log puts it
+ * on the Logs page where it is actually findable.
+ */
+async function logMissingEntities(missing: MissingEntityReport[]): Promise<void> {
+  if (missing.length === 0) return;
+
+  const breaking = missing.filter(m => m.breaksUsageTracking);
+  const summary = missing
+    .map(m => `${m.name || m.prefix} (${m.missing.join(', ')})`)
+    .join('; ');
+
+  await createActivityLog({
+    type: 'error',
+    message: breaking.length > 0
+      ? `Filament usage tracking is disabled for ${breaking.length} printer(s) — required Home Assistant entities were not found: ${summary}`
+      : `Some Home Assistant entities were not found: ${summary}`,
+    details: { missingEntities: missing },
+  });
+}
 
 export async function GET() {
   try {
@@ -65,8 +93,10 @@ export async function POST(request: NextRequest) {
         }, { status: 400 });
       }
 
-      // Use the same config generator as embedded mode for consistency
-      const config = generateHAConfig(printers, webhookUrl, webhookUrl);
+      // Use the same config generator as embedded mode for consistency.
+      // Generate/inject the webhook secret so the produced automations authenticate.
+      const webhookSecret = await getOrCreateWebhookSecret();
+      const config = generateHAConfig(printers, webhookUrl, webhookUrl, webhookSecret);
 
       // Return printer registration data so the frontend can register
       // automations in the same per-printer format as auto-configure
@@ -79,12 +109,15 @@ export async function POST(request: NextRequest) {
         ],
       }));
 
+      await logMissingEntities(config.missingEntities);
+
       return NextResponse.json({
         trayCount: config.trayCount,
         printerCount: config.printerCount,
         automationsYaml: config.automationsYaml,
         configurationYaml: config.configurationAdditions,
         printerRegistrations,
+        missingEntities: config.missingEntities,
       });
     }
 
@@ -129,6 +162,10 @@ export async function POST(request: NextRequest) {
       await prisma.automation.deleteMany({
         where: { haAutomationId: 'spoolmansync_external-mode-configured' },
       });
+
+      // The token-carrying automations are now applied — begin enforcing the
+      // webhook secret. (Done here, not at preview time, so deductions never break.)
+      await enableWebhookAuth();
 
       const totalTrays = printerRegistrations.reduce((sum: number, r: { trayIds: string[] }) => sum + r.trayIds.length, 0);
       await createActivityLog({
@@ -176,11 +213,14 @@ export async function POST(request: NextRequest) {
         ? `http://127.0.0.1:${addonPort}/api/webhook`
         : 'http://spoolmansync-app:3000/api/webhook';
 
-      // Generate configuration
+      // Generate configuration. Generate/inject the webhook secret so the
+      // produced automations authenticate to the webhook.
+      const webhookSecret = await getOrCreateWebhookSecret();
       const config = generateHAConfig(
         printers,
         internalWebhookUrl,
-        internalWebhookUrl
+        internalWebhookUrl,
+        webhookSecret
       );
 
       // Write config files to HA config directory
@@ -216,9 +256,19 @@ export async function POST(request: NextRequest) {
 
           // Step 1: Strip any legacy SpoolmanSync block from configuration.yaml
           // (from previous versions that appended directly)
-          const cleanedConfig = stripSpoolmanSyncConfig(existingConfig);
+          let cleanedConfig = stripSpoolmanSyncConfig(existingConfig);
           if (cleanedConfig !== existingConfig) {
             console.log('Stripped legacy SpoolmanSync config block from configuration.yaml');
+          }
+
+          // Step 1b: Repair the duplicate-packages state older versions could
+          // create (issue #73): our directive inserted alongside the user's own
+          // packages: line. Remove ours so detection below finds theirs and the
+          // package file lands in the directory HA actually loads.
+          const repair = repairDuplicatePackagesDirective(cleanedConfig);
+          if (repair.repaired) {
+            cleanedConfig = repair.content;
+            console.log('Removed duplicate SpoolmanSync packages directive from configuration.yaml (issue #73 repair)');
           }
 
           // Step 2: Detect current packages configuration style
@@ -244,17 +294,54 @@ export async function POST(request: NextRequest) {
           await fs.writeFile(packageFilePath, packageContent, 'utf-8');
           console.log(`Wrote package file: ${packageFilePath}`);
 
+          // If the repair moved us out of the broken duplicate state, the old
+          // package file under packages/ is orphaned (that directory is no
+          // longer referenced). Best-effort cleanup so it can't confuse anyone.
+          const legacyPackageFile = `${haConfigPath}/packages/spoolmansync.yaml`;
+          if (repair.repaired && packageFilePath !== legacyPackageFile) {
+            try {
+              await fs.unlink(legacyPackageFile);
+              console.log('Removed orphaned package file from packages/ (issue #73 repair)');
+            } catch { /* already gone — fine */ }
+          }
+
           // Step 4: Modify configuration.yaml if needed (scenarios A and C)
           let finalConfig = cleanedConfig;
-          let configModified = cleanedConfig !== existingConfig; // true if legacy block was stripped
+          let configModified = cleanedConfig !== existingConfig; // true if legacy block was stripped or repaired
 
           if (packagesConfig.style === 'none') {
-            // Scenario A: add packages directive
-            finalConfig = addPackagesDirective(finalConfig);
+            // Scenario A: add packages directive. This REFUSES rather than
+            // inserting a duplicate when an unrecognized packages: entry already
+            // exists (issue #73) — a loud error beats a silently broken setup.
+            const directiveResult = addPackagesDirective(finalConfig);
+            if (directiveResult.conflict) {
+              // Deliberately do NOT delete the package file that was just
+              // written: it is inert unless something includes it, and in
+              // split configs (homeassistant: !include ...) this exact path
+              // may already be loaded via an include this tool cannot see —
+              // deleting it would break a working setup.
+              return NextResponse.json({
+                error: `Cannot configure automatically: ${directiveResult.conflict}. ` +
+                  `The package file was written to ${packageFilePath}; make sure your packages configuration loads that folder, ` +
+                  'or share your configuration.yaml formatting at https://github.com/gibz104/SpoolmanSync/issues so detection can be improved.',
+              }, { status: 400 });
+            }
+            finalConfig = directiveResult.content;
             configModified = true;
           } else if (packagesConfig.style === 'named' && !packagesConfig.hasSpoolmansync) {
             // Scenario C: add spoolmansync entry under existing packages block
-            finalConfig = addPackageEntry(finalConfig, packagesConfig);
+            const withEntry = addPackageEntry(finalConfig, packagesConfig);
+            if (withEntry === finalConfig) {
+              // The entry could not be placed — refuse loudly instead of
+              // reporting success with a package HA will never load. The
+              // written package file is left in place (inert until included).
+              return NextResponse.json({
+                error: 'Cannot configure automatically: configuration.yaml has a packages: block SpoolmanSync could not add an entry to. ' +
+                  `The package file was written to ${packageFilePath}; add "spoolmansync: !include spoolmansync_package.yaml" under your packages: block yourself, ` +
+                  'or share your configuration.yaml formatting at https://github.com/gibz104/SpoolmanSync/issues so detection can be improved.',
+              }, { status: 400 });
+            }
+            finalConfig = withEntry;
             configModified = true;
           }
 
@@ -355,6 +442,10 @@ export async function POST(request: NextRequest) {
           console.log(`Cleaned up ${staleRecords.length} stale automation record(s)`);
         }
 
+        // Token-carrying automations have been written and HA (re)started — begin
+        // enforcing the webhook secret now that the applied automations carry it.
+        await enableWebhookAuth();
+
         const allTrayIds = printers.flatMap(p => [
           ...p.ams_units.flatMap(ams => ams.trays.map(t => t.entity_id)),
           ...p.external_spools.map(es => es.entity_id),
@@ -366,11 +457,14 @@ export async function POST(request: NextRequest) {
           details: { printers: printers.map(p => p.name), trayIds: allTrayIds },
         });
 
+        await logMissingEntities(config.missingEntities);
+
         const addonMode = isAddonMode();
         return NextResponse.json({
           success: true,
           printerCount: config.printerCount,
           trayCount: config.trayCount,
+          missingEntities: config.missingEntities,
           needsRestart: addonMode,
           message: addonMode
             ? `Configuration written for ${config.printerCount} printer(s), ${config.trayCount} tray(s). Home Assistant restart required to apply changes.`

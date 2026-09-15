@@ -1,94 +1,11 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/db';
-import { HomeAssistantClient, HATray } from '@/lib/api/homeassistant';
-import { SpoolmanClient, Spool } from '@/lib/api/spoolman';
+import { HomeAssistantClient } from '@/lib/api/homeassistant';
+import { SpoolmanClient } from '@/lib/api/spoolman';
 import { getHiddenPrinters } from '@/app/api/printers/setup/route';
-import { isValidTrayUuid } from '@/lib/tray-uuid';
-
-interface MismatchInfo {
-  type: 'material' | 'color' | 'both';
-  printerReports: {
-    material?: string;
-    color?: string;
-  };
-  spoolmanHas: {
-    material: string;
-    color: string;
-  };
-  message: string;
-}
-
-/**
- * Detect if the printer's RFID data doesn't match the assigned spool
- * This helps users catch mistakes before printing with the wrong filament
- *
- * Compares material type and hex color code. The RFID color includes an alpha
- * channel (e.g., "#042f56ff") while Spoolman uses 6-char hex (e.g., "#042f56"),
- * so we compare only the first 6 hex characters.
- *
- * Note: Only works for Bambu spools with RFID tags. Non-Bambu spools
- * won't have printer-reported data to compare against.
- */
-function detectTrayMismatch(tray: HATray, assignedSpool: Spool): MismatchInfo | null {
-  // Skip mismatch detection for non-RFID spools. ha-bambulab reports tray_uuid
-  // as all zeros for third-party spools without RFID tags. The color/material
-  // data for these is user-configured in Bambu Studio (not from RFID), so it
-  // won't reliably match Spoolman's vendor data and would cause false warnings.
-  if (!isValidTrayUuid(tray.tray_uuid)) {
-    return null;
-  }
-
-  // If the tray has no material reported by printer, can't detect mismatch
-  const trayName = tray.name?.toLowerCase().trim() || '';
-  if (!trayName || trayName === 'empty') {
-    return null;
-  }
-
-  const printerMaterial = tray.material?.toUpperCase() || '';
-  const spoolMaterial = assignedSpool.filament?.material?.toUpperCase() || '';
-
-  // Compare base material tokens (first word) so variants like "PLA Matte"
-  // and "PLA Silk+" are treated as compatible with "PLA", while
-  // materials like "PLA-CF" remain distinct from "PLA".
-  const basePrinterMaterial = printerMaterial.split(/\s+/)[0] || '';
-  const baseSpoolMaterial = spoolMaterial.split(/\s+/)[0] || '';
-
-  // Get hex colors - RFID may have alpha channel (8 chars), Spoolman has 6 chars
-  // Compare only first 6 characters (RGB, ignore alpha)
-  const rfidColor = tray.color?.replace('#', '').toLowerCase().substring(0, 6) || '';
-  const spoolColor = assignedSpool.filament?.color_hex?.toLowerCase().substring(0, 6) || '';
-
-  // Check for material mismatch
-  const materialMismatch =
-    basePrinterMaterial &&
-    baseSpoolMaterial &&
-    basePrinterMaterial !== baseSpoolMaterial;
-
-  // Check for color mismatch (exact match on first 6 hex chars)
-  const colorMismatch = rfidColor && spoolColor && rfidColor !== spoolColor;
-
-  if (!materialMismatch && !colorMismatch) {
-    return null;
-  }
-
-  // Build mismatch info
-  const mismatchType: 'material' | 'color' | 'both' =
-    materialMismatch && colorMismatch ? 'both' :
-    materialMismatch ? 'material' : 'color';
-
-  return {
-    type: mismatchType,
-    printerReports: {
-      material: tray.material,
-      color: `#${rfidColor}`,
-    },
-    spoolmanHas: {
-      material: assignedSpool.filament?.material || '',
-      color: `#${spoolColor}`,
-    },
-    message: `Mismatch detected: ${mismatchType}`,
-  };
-}
+import { getVirtualPrinters, virtualPrintersToHAPrinters, migrateVirtualKeys, withVirtualLock } from '@/lib/virtual-printers';
+import { detectTrayMismatch } from '@/lib/tray-mismatch';
+import { reconcileSpoolLocations } from '@/lib/spool-location';
 
 export async function GET() {
   try {
@@ -113,9 +30,22 @@ export async function GET() {
         })
       : allPrinters;
 
+    // Merge in user-defined virtual printers (dry boxes / dryers, issue #67).
+    // They have no HA entity and no automation record, so they're enriched with
+    // spool data below and rendered like any printer, but are skipped by the
+    // staleness check and never receive usage webhooks.
+    const virtualPrinters = virtualPrintersToHAPrinters(await getVirtualPrinters());
+    printers.push(...virtualPrinters);
+
     // If Spoolman is configured, enrich with spool data
     if (spoolmanConnection) {
       const spoolmanClient = new SpoolmanClient(spoolmanConnection.url);
+
+      // One-time: migrate legacy virtual-slot keys to the friendly format before
+      // we match assignments, so re-keyed spools resolve to their virtual slots.
+      // Serialized so it can't clobber a concurrent virtual-printer mutation.
+      await withVirtualLock(() => migrateVirtualKeys(spoolmanClient));
+
       const spools = await spoolmanClient.getSpools();
 
       // Build entity_id → unique_id map from discovered trays for migration.
@@ -126,6 +56,10 @@ export async function GET() {
       // Also build a set of all known unique_ids for fallback matching
       const allUniqueIds = new Set<string>();
       for (const printer of printers) {
+        // Skip virtual printers: their friendly keys (virtual_<name>_tray_N) end
+        // in _tray_N and would otherwise become a target for the renamed-real-tray
+        // suffix-fallback below, which could re-point a real spool onto a dry box.
+        if (printer.is_virtual) continue;
         for (const ams of printer.ams_units) {
           for (const tray of ams.trays) {
             if (tray.unique_id) {
@@ -198,6 +132,24 @@ export async function GET() {
         traySpoolMap.set(cleanId, spool);
       }
 
+      // Heal stale location labels after a printer rename in HA. Locations are
+      // only written at assignment time, so without this a renamed printer left
+      // every assigned spool parked under the old name until manually
+      // re-assigned. Runs AFTER the entity_id → unique_id migration above so
+      // just-migrated assignments resolve in the same load, and BEFORE
+      // enrichment so the response carries the healed locations. Hand-set
+      // locations are never touched (see reconcileSpoolLocations).
+      try {
+        await reconcileSpoolLocations(spoolmanClient, printers, spools);
+      } catch (err) {
+        console.warn('Location label reconcile failed (non-fatal):', err);
+      }
+
+      // Opt-out for tags whose reported color doesn't describe the physical
+      // spool (issue #79). Read once, not per tray.
+      const ignoreColorSetting = await prisma.settings.findUnique({ where: { key: 'ignore_color_mismatch' } });
+      const ignoreColor = ignoreColorSetting?.value === 'true';
+
       // Enrich printer data with spool info and mismatch detection
       // Match by unique_id (stable across entity renames)
       for (const printer of printers) {
@@ -209,7 +161,7 @@ export async function GET() {
             if (assignedSpool) {
               trayRecord.assigned_spool = assignedSpool;
 
-              const mismatch = detectTrayMismatch(tray, assignedSpool);
+              const mismatch = detectTrayMismatch(tray, assignedSpool, { brand: printer.brand, ignoreColor });
               if (mismatch) {
                 trayRecord.mismatch = mismatch;
               }

@@ -5,6 +5,18 @@ import { Nav } from '@/components/nav';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { toast } from 'sonner';
 
 interface ActivityLog {
   id: string;
@@ -43,6 +55,14 @@ export default function LogsPage() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const seenLogIdsRef = useRef<Set<string>>(new Set());
 
+  // Edit/delete state for usage events (issue #54)
+  const [editTarget, setEditTarget] = useState<ActivityLog | null>(null);
+  const [editWeight, setEditWeight] = useState('');
+  const [editAdjustSpoolman, setEditAdjustSpoolman] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ActivityLog | null>(null);
+  const [deleteAdjustSpoolman, setDeleteAdjustSpoolman] = useState(false);
+  const [mutating, setMutating] = useState(false);
+
   const fetchLogs = useCallback(async (pageNum: number = page, filterType: FilterType = filter, limit: number = pageSize) => {
     try {
       setLoading(true);
@@ -72,6 +92,7 @@ export default function LogsPage() {
     let sseConnected = false;
     let pollInterval: NodeJS.Timeout | null = null;
     let sseCheckTimeout: NodeJS.Timeout | null = null;
+    let reconnectTimeout: NodeJS.Timeout | null = null;
 
     const startPolling = () => {
       if (pollInterval) return;
@@ -81,10 +102,7 @@ export default function LogsPage() {
       }, 2000);
     };
 
-    eventSource = new EventSource('/api/events');
-    eventSourceRef.current = eventSource;
-
-    eventSource.onmessage = (event) => {
+    const handleSSEMessage = (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
 
@@ -94,6 +112,12 @@ export default function LogsPage() {
           if (sseCheckTimeout) {
             clearTimeout(sseCheckTimeout);
             sseCheckTimeout = null;
+          }
+          // If we fell back to polling after a drop and SSE has now
+          // re-established, stop the redundant polling.
+          if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
           }
           return;
         }
@@ -136,19 +160,33 @@ export default function LogsPage() {
       }
     };
 
-    eventSource.onerror = () => {
-      setConnected(false);
-      eventSource?.close();
-      eventSource = null;
-      eventSourceRef.current = null;
-      if (!sseConnected) {
-        if (sseCheckTimeout) {
-          clearTimeout(sseCheckTimeout);
-          sseCheckTimeout = null;
+    const connect = () => {
+      eventSource = new EventSource('/api/events');
+      eventSourceRef.current = eventSource;
+      eventSource.onmessage = handleSSEMessage;
+
+      eventSource.onerror = () => {
+        setConnected(false);
+        eventSource?.close();
+        eventSource = null;
+        eventSourceRef.current = null;
+        if (!sseConnected) {
+          // SSE never connected — go straight to polling
+          if (sseCheckTimeout) {
+            clearTimeout(sseCheckTimeout);
+            sseCheckTimeout = null;
+          }
+          startPolling();
+        } else {
+          // Was connected then dropped — fall back to polling so updates keep
+          // flowing, and also try to re-establish SSE after a short delay
+          startPolling();
+          reconnectTimeout = setTimeout(connect, 5000);
         }
-        startPolling();
-      }
+      };
     };
+
+    connect();
 
     // If SSE doesn't deliver a "connected" message within 4 seconds, fall back to polling
     sseCheckTimeout = setTimeout(() => {
@@ -163,6 +201,7 @@ export default function LogsPage() {
     return () => {
       eventSource?.close();
       if (sseCheckTimeout) clearTimeout(sseCheckTimeout);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [filter, page, pageSize, fetchLogs]);
@@ -245,6 +284,97 @@ export default function LogsPage() {
     return new Date(dateString).toLocaleString();
   };
 
+  // Pretty-print details JSON, falling back to the raw string if it isn't
+  // valid JSON so a malformed payload never crashes the row.
+  const formatDetails = (details: string) => {
+    try {
+      return JSON.stringify(JSON.parse(details), null, 2);
+    } catch {
+      return details;
+    }
+  };
+
+  // Pull the recorded usedWeight (grams) out of a usage event's details JSON.
+  // Guarded the same way as formatDetails so a malformed payload never crashes.
+  const getUsedWeight = (details: string | null): number | null => {
+    if (!details) return null;
+    try {
+      const parsed = JSON.parse(details);
+      return typeof parsed.usedWeight === 'number' ? parsed.usedWeight : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const openEdit = (log: ActivityLog) => {
+    const current = getUsedWeight(log.details);
+    setEditTarget(log);
+    setEditWeight(current != null ? String(current) : '');
+    setEditAdjustSpoolman(false);
+  };
+
+  const openDelete = (log: ActivityLog) => {
+    setDeleteTarget(log);
+    setDeleteAdjustSpoolman(false);
+  };
+
+  const handleEditSave = async () => {
+    if (!editTarget) return;
+    const weight = Number(editWeight);
+    if (!isFinite(weight) || weight < 0) {
+      toast.error('Enter a valid non-negative weight in grams');
+      return;
+    }
+    try {
+      setMutating(true);
+      const res = await fetch('/api/logs', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: editTarget.id, usedWeight: weight, adjustSpoolman: editAdjustSpoolman }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error || 'Failed to edit usage event');
+      }
+      toast.success('Usage event updated');
+      if (data.warning) {
+        toast.error(data.warning);
+      }
+      setEditTarget(null);
+      await fetchLogs(page, filter, pageSize);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to edit usage event');
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    try {
+      setMutating(true);
+      const res = await fetch('/api/logs', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: deleteTarget.id, adjustSpoolman: deleteAdjustSpoolman }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error || 'Failed to delete usage event');
+      }
+      toast.success('Usage event deleted');
+      if (data.warning) {
+        toast.error(data.warning);
+      }
+      setDeleteTarget(null);
+      await fetchLogs(page, filter, pageSize);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to delete usage event');
+    } finally {
+      setMutating(false);
+    }
+  };
+
   if (loading && logs.length === 0) {
     return (
       <div className="min-h-screen bg-background">
@@ -276,6 +406,11 @@ export default function LogsPage() {
             {loading ? 'Loading...' : 'Refresh'}
           </Button>
         </div>
+
+        <p className="mb-4 text-xs text-muted-foreground">
+          By default, editing or deleting a usage event only corrects SpoolmanSync statistics — it does not change the
+          spool&apos;s remaining weight in Spoolman unless you opt in.
+        </p>
 
         {/* Filter tabs */}
         <div className="mb-4 grid grid-cols-4 sm:flex sm:flex-wrap gap-2">
@@ -334,9 +469,27 @@ export default function LogsPage() {
                             Details
                           </summary>
                           <pre className="mt-1 p-2 bg-muted rounded text-xs overflow-x-auto">
-                            {JSON.stringify(JSON.parse(log.details), null, 2)}
+                            {formatDetails(log.details)}
                           </pre>
                         </details>
+                      )}
+                      {log.type === 'spool_usage' && (
+                        <div className="mt-2 flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => openEdit(log)}
+                            className="text-xs text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openDelete(log)}
+                            className="text-xs text-muted-foreground hover:text-destructive underline-offset-2 hover:underline"
+                          >
+                            Delete
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -399,6 +552,86 @@ export default function LogsPage() {
             )}
           </CardContent>
         </Card>
+
+        {/* Edit usage event dialog (issue #54) */}
+        <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null); }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Edit usage event</DialogTitle>
+              <DialogDescription>
+                Correct the grams recorded for this usage event. This only updates SpoolmanSync statistics unless you
+                opt in to adjust Spoolman below.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4 py-2">
+              <div className="space-y-2">
+                <Label htmlFor="editWeight">Used weight (g)</Label>
+                <Input
+                  id="editWeight"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={editWeight}
+                  onChange={(e) => setEditWeight(e.target.value)}
+                  disabled={mutating}
+                />
+              </div>
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id="editAdjustSpoolman"
+                  checked={editAdjustSpoolman}
+                  onCheckedChange={(checked) => setEditAdjustSpoolman(checked === true)}
+                  disabled={mutating}
+                />
+                <Label htmlFor="editAdjustSpoolman" className="text-sm font-normal leading-snug">
+                  Also adjust Spoolman remaining weight
+                </Label>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setEditTarget(null)} disabled={mutating}>
+                Cancel
+              </Button>
+              <Button onClick={handleEditSave} disabled={mutating}>
+                {mutating ? 'Saving...' : 'Save'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Delete usage event confirmation dialog (issue #54) */}
+        <Dialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Delete usage event</DialogTitle>
+              <DialogDescription>
+                This removes the usage event from SpoolmanSync statistics. It does not change the spool&apos;s remaining
+                weight in Spoolman unless you opt in below.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-2">
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id="deleteAdjustSpoolman"
+                  checked={deleteAdjustSpoolman}
+                  onCheckedChange={(checked) => setDeleteAdjustSpoolman(checked === true)}
+                  disabled={mutating}
+                />
+                <Label htmlFor="deleteAdjustSpoolman" className="text-sm font-normal leading-snug">
+                  Also adjust Spoolman remaining weight (return the deducted grams to the spool)
+                </Label>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={mutating}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={handleDeleteConfirm} disabled={mutating}>
+                {mutating ? 'Deleting...' : 'Delete'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </main>
     </div>
   );

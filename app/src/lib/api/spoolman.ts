@@ -72,6 +72,36 @@ export function parseExtraValue(value: string | undefined): string {
 }
 
 /**
+ * Normalize a spool serial / RFID tag for comparison.
+ *
+ * Values reach us from three places that don't agree on formatting:
+ *  - SpoolmanSync's own writes (`setSpoolTag`) — JSON-encoded, e.g. `"\"AB12\""`
+ *  - hand-edits in Spoolman's UI or via its API — may be stored bare, e.g. `AB12`
+ *  - ha-bambulab's `tray_uuid` attribute — casing is not guaranteed stable
+ *
+ * We unwrap the JSON encoding, then trim and case-fold, so a tag only fails to
+ * match when it genuinely differs. Comparing raw strings here silently broke
+ * auto-matching for anyone whose tag was entered by hand.
+ *
+ * Deliberately NOT parseExtraValue: that coerces any JSON value to a string, so
+ * an all-numeric serial stored bare would be read as a number and come back
+ * mangled ("1234...012" → "1.234...e+31", "1e5" → "100000"). A serial is always
+ * an opaque identifier, so we only unwrap when the JSON value is a string and
+ * otherwise keep the raw text exactly as written.
+ */
+export function normalizeTag(value: string | undefined | null): string {
+  if (!value) return '';
+  let unwrapped = value;
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === 'string') unwrapped = parsed;
+  } catch {
+    // Not JSON — a bare, hand-entered value. Use it as-is.
+  }
+  return unwrapped.trim().toLowerCase();
+}
+
+/**
  * Build a searchable string from a spool object
  * Includes all fields for full-text search
  */
@@ -121,9 +151,27 @@ export const DEFAULT_ENABLED_FILTERS = ['material', 'vendor'];
  */
 export type EntityIdResolver = (entityId: string) => Promise<string>;
 
+/**
+ * Resolver that maps a tray key (unique_id, entity_id, or virtual slot key) to a
+ * human-readable Spoolman `location` label. Returns '' when the tray can't be
+ * resolved (in which case the location field is left untouched). Provided by
+ * callers only when location sync is enabled — see makeLocationResolver().
+ */
+export type LocationResolver = (trayKey: string) => Promise<string>;
+
+/**
+ * Spoolman's `location` field is `str | None` with max_length 64. Lives here
+ * (with the API client) rather than in spool-location.ts so this module can
+ * enforce it without importing the DB-backed settings layer, which would create
+ * a circular import.
+ */
+export const SPOOLMAN_LOCATION_MAX = 64;
+
 export class SpoolmanClient {
   private baseUrl: string;
   private entityIdResolver: EntityIdResolver | null = null;
+  private locationResolver: LocationResolver | null = null;
+  private unassignedLocation = '';
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -139,6 +187,31 @@ export class SpoolmanClient {
    */
   setEntityIdResolver(resolver: EntityIdResolver): void {
     this.entityIdResolver = resolver;
+  }
+
+  /**
+   * Set a resolver that maps a tray key to a Spoolman `location` label. When set,
+   * assignSpoolToTray writes the resolved label into the native `location` field,
+   * and unassignSpoolFromTray clears it — but only if it still matches the label
+   * we set (so a manually-set location is never destroyed). When not set (sync
+   * disabled), the `location` field is left completely untouched.
+   */
+  setLocationResolver(resolver: LocationResolver): void {
+    this.locationResolver = resolver;
+  }
+
+  /**
+   * Optional "holding pen": where a spool's `location` goes when it is
+   * unassigned, instead of being unset.
+   *
+   * Applies only inside the same guard as the clear — the location is replaced
+   * only when it still equals the label SpoolmanSync wrote for the tray being
+   * left, so a location set by hand is never overwritten. Has no effect unless
+   * a location resolver is also set (i.e. location sync is enabled), and an
+   * empty value keeps the original clear-on-unassign behavior.
+   */
+  setUnassignedLocation(location: string): void {
+    this.unassignedLocation = (location || '').trim();
   }
 
   /**
@@ -211,6 +284,34 @@ export class SpoolmanClient {
   }
 
   /**
+   * Read Spoolman's user-managed location list.
+   *
+   * Spoolman keeps this in the `locations` *setting* (a JSON-encoded array of
+   * strings), NOT on the spools — see its Locations page, which reads the same
+   * setting. A location created there exists before any spool is moved into it,
+   * and deleting one removes it from the setting while leaving the string on
+   * whatever spools still sit in it.
+   *
+   * Returns [] on any failure. Older Spoolman versions have no such setting,
+   * and the caller falls back to locations derived from spools.
+   */
+  async getConfiguredLocations(): Promise<string[]> {
+    try {
+      const setting = await this.fetch<{ value?: unknown }>('/setting/locations');
+      if (typeof setting?.value !== 'string') return [];
+      const parsed = JSON.parse(setting.value);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((v): v is string => typeof v === 'string')
+        .map(v => v.trim())
+        .filter(v => v.length > 0);
+    } catch {
+      // Not fatal: pre-locations Spoolman (404) or a transient failure.
+      return [];
+    }
+  }
+
+  /**
    * Update a spool (generic PATCH)
    */
   async updateSpool(id: number, data: Record<string, unknown>): Promise<Spool> {
@@ -252,12 +353,20 @@ export class SpoolmanClient {
     }
     newExtra['active_tray'] = JSON.stringify(trayId);
 
+    // Build the PATCH body. `location` is a native top-level field (NOT in extra).
+    const body: Record<string, unknown> = { extra: await this.sanitizeExtra(newExtra) };
+
+    // If location sync is enabled, set the native location to reflect this tray.
+    // An unresolved tray ('') leaves location untouched.
+    if (this.locationResolver) {
+      const label = await this.locationResolver(trayId);
+      if (label) body.location = label;
+    }
+
     // Assign the new spool
     return this.fetch(`/spool/${spoolId}`, {
       method: 'PATCH',
-      body: JSON.stringify({
-        extra: await this.sanitizeExtra(newExtra),
-      }),
+      body: JSON.stringify(body),
     });
   }
 
@@ -267,6 +376,10 @@ export class SpoolmanClient {
   async unassignSpoolFromTray(spoolId: number): Promise<Spool> {
     // Get current spool to preserve other extra fields
     const spool = await this.getSpool(spoolId);
+
+    // Capture the tray we're leaving (before clearing it) so we can decide
+    // whether to also clear the native location field.
+    const oldTrayRaw = spool.extra?.['active_tray'];
 
     // Build new extra object with active_tray set to empty string
     // Spoolman's PATCH replaces the entire extra object, so we need to include
@@ -283,12 +396,36 @@ export class SpoolmanClient {
     // Spoolman requires extra field values to be valid JSON
     newExtra['active_tray'] = JSON.stringify('');
 
+    const body: Record<string, unknown> = { extra: await this.sanitizeExtra(newExtra) };
+
+    // GUARDED location clear: only touch `location` if it still equals the label
+    // we would have set for the tray being left. This means a location the user
+    // set (or changed) by hand is never destroyed by an unassign.
+    if (this.locationResolver && spool.location) {
+      let oldTray = '';
+      if (oldTrayRaw) {
+        try {
+          const parsed = JSON.parse(oldTrayRaw);
+          if (typeof parsed === 'string') oldTray = parsed;
+        } catch { /* not JSON — leave blank, we won't clear */ }
+      }
+      if (oldTray) {
+        const label = await this.locationResolver(oldTray);
+        if (label && label === spool.location) {
+          // With a holding pen configured, park the spool there so it stays
+          // visible in Spoolman's location views instead of vanishing from them.
+          // Otherwise null, which truly unsets Spoolman's `str | None` field.
+          body.location = this.unassignedLocation
+            ? this.unassignedLocation.slice(0, SPOOLMAN_LOCATION_MAX)
+            : null;
+        }
+      }
+    }
+
     // Send the updated extra object with empty active_tray
     return this.fetch<Spool>(`/spool/${spoolId}`, {
       method: 'PATCH',
-      body: JSON.stringify({
-        extra: await this.sanitizeExtra(newExtra),
-      }),
+      body: JSON.stringify(body),
     });
   }
 
@@ -329,61 +466,53 @@ export class SpoolmanClient {
    */
   async clearDuplicateTags(trayUuid: string, exceptSpoolId: number): Promise<void> {
     const spools = await this.getSpools();
+    const target = normalizeTag(trayUuid);
+    if (!target) return;
 
     for (const spool of spools) {
       if (spool.id === exceptSpoolId) continue;
+      if (normalizeTag(spool.extra?.['tag']) !== target) continue;
 
-      const existingTagRaw = spool.extra?.['tag'];
-      if (!existingTagRaw) continue;
-
-      try {
-        const parsed = JSON.parse(existingTagRaw);
-        if (parsed === trayUuid) {
-          // Clear the tag from this spool
-          const newExtra: Record<string, string> = {};
-          if (spool.extra) {
-            for (const [key, value] of Object.entries(spool.extra)) {
-              if (key !== 'tag') {
-                newExtra[key] = value;
-              }
-            }
+      // Clear the tag from this spool
+      const newExtra: Record<string, string> = {};
+      if (spool.extra) {
+        for (const [key, value] of Object.entries(spool.extra)) {
+          if (key !== 'tag') {
+            newExtra[key] = value;
           }
-          newExtra['tag'] = JSON.stringify('');
-
-          await this.fetch<Spool>(`/spool/${spool.id}`, {
-            method: 'PATCH',
-            body: JSON.stringify({
-              extra: await this.sanitizeExtra(newExtra),
-            }),
-          });
         }
-      } catch {
-        // If parsing fails, skip this spool
       }
+      newExtra['tag'] = JSON.stringify('');
+
+      await this.fetch<Spool>(`/spool/${spool.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          extra: await this.sanitizeExtra(newExtra),
+        }),
+      });
     }
   }
 
   /**
-   * Find a spool by its serial number (tray_uuid)
+   * Find a spool by its serial number (tray_uuid).
+   * Comparison is normalized — see normalizeTag().
    */
   async findSpoolByTag(trayUuid: string): Promise<Spool | null> {
     const spools = await this.getSpools();
+    const target = normalizeTag(trayUuid);
+    if (!target) return null;
 
-    for (const spool of spools) {
-      const existingTagRaw = spool.extra?.['tag'];
-      if (!existingTagRaw) continue;
+    return spools.find(s => normalizeTag(s.extra?.['tag']) === target) ?? null;
+  }
 
-      try {
-        const parsed = JSON.parse(existingTagRaw);
-        if (parsed === trayUuid) {
-          return spool;
-        }
-      } catch {
-        // If parsing fails, skip this spool
-      }
-    }
-
-    return null;
+  /**
+   * Count spools that carry a non-empty serial/RFID tag. Used purely for
+   * diagnostics: it distinguishes "nothing is tagged yet" (expected before a
+   * spool's first tracked print) from "tags exist but none matched" (a real
+   * mismatch worth investigating).
+   */
+  countTaggedSpools(spools: Spool[]): number {
+    return spools.filter(s => normalizeTag(s.extra?.['tag']) !== '').length;
   }
 
   /**

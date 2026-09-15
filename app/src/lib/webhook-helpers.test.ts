@@ -1,0 +1,78 @@
+import { describe, it, expect } from 'vitest';
+import { classifyTrayState, lengthToWeight, isValidTrayUuid, isActivePrintState, MATERIAL_DENSITY } from './webhook-helpers';
+
+describe('classifyTrayState (issue #65 — never clear on transient states)', () => {
+  it('treats unavailable/unknown/missing as transient (must NOT clear assignment)', () => {
+    expect(classifyTrayState(undefined)).toBe('transient');
+    expect(classifyTrayState(null)).toBe('transient');
+    expect(classifyTrayState('unavailable')).toBe('transient');
+    expect(classifyTrayState('unknown')).toBe('transient');
+    expect(classifyTrayState('Unavailable')).toBe('transient'); // case-insensitive
+    expect(classifyTrayState('UNKNOWN')).toBe('transient');
+  });
+
+  it('treats literal Empty and blank name as empty', () => {
+    expect(classifyTrayState('Empty')).toBe('empty');
+    expect(classifyTrayState('empty')).toBe('empty');
+    expect(classifyTrayState('')).toBe('empty'); // Creality empty slot
+  });
+
+  it('treats a real filament name as present', () => {
+    expect(classifyTrayState('PLA')).toBe('present');
+    expect(classifyTrayState('Matte Dark Blue')).toBe('present');
+    expect(classifyTrayState('PETG-CF')).toBe('present');
+  });
+});
+
+describe('lengthToWeight (Creality cm → g conversion)', () => {
+  it('converts using PLA density by default', () => {
+    // volume = π * 0.0875^2 * 100 = 2.40528 cm³; * 1.24 = 2.9825 g
+    expect(lengthToWeight(100)).toBeCloseTo(2.9825, 3);
+    expect(lengthToWeight(100, 'PLA')).toBeCloseTo(2.9825, 3);
+  });
+
+  it('uses material-specific density', () => {
+    expect(lengthToWeight(100, 'ABS')).toBeCloseTo(2.40528 * MATERIAL_DENSITY.ABS, 3);
+    // denser material → heavier for same length
+    expect(lengthToWeight(100, 'PETG')).toBeGreaterThan(lengthToWeight(100, 'ABS'));
+  });
+
+  it('is case-insensitive and falls back to PLA for unknown materials', () => {
+    expect(lengthToWeight(50, 'pla')).toBeCloseTo(lengthToWeight(50, 'PLA'), 6);
+    expect(lengthToWeight(50, 'WoodFill')).toBeCloseTo(lengthToWeight(50, 'PLA'), 6);
+  });
+
+  it('scales linearly with length and is zero at zero', () => {
+    expect(lengthToWeight(0)).toBe(0);
+    expect(lengthToWeight(200)).toBeCloseTo(2 * lengthToWeight(100), 6);
+  });
+});
+
+describe('isValidTrayUuid', () => {
+  it('rejects empty / unknown / all-zero ids (non-Bambu spools)', () => {
+    expect(isValidTrayUuid(undefined)).toBe(false);
+    expect(isValidTrayUuid(null)).toBe(false);
+    expect(isValidTrayUuid('')).toBe(false);
+    expect(isValidTrayUuid('unknown')).toBe(false);
+    expect(isValidTrayUuid('0000000000000000')).toBe(false);
+  });
+
+  it('accepts a real serial', () => {
+    expect(isValidTrayUuid('A1B2C3D4')).toBe(true);
+    expect(isValidTrayUuid('0000A0000')).toBe(true); // not all zeros
+  });
+});
+
+describe('isActivePrintState', () => {
+  it('treats terminal/unknown states as inactive', () => {
+    for (const state of [undefined, null, '', 'idle', 'finished', 'completed', 'complete', 'offline', 'off', 'none', 'unknown', 'unavailable']) {
+      expect(isActivePrintState(state)).toBe(false);
+    }
+  });
+
+  it('treats printing/pausing style states as active', () => {
+    for (const state of ['printing', 'running', 'paused', 'pause', 'prepare', 'slicing', 'auto_bed_leveling']) {
+      expect(isActivePrintState(state)).toBe(true);
+    }
+  });
+});
